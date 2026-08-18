@@ -282,6 +282,238 @@ final class UnivapayMigrateFlagsTest extends TestCase
         $this->assertArrayHasKey('line', $report['networkException'][0]);
     }
 
+    /**
+     * Regression test for a real bug found migrating a WordPress plugin: when every usage of an
+     * imported class lives inside a function declared NESTED inside another function,
+     * RenameClassRector renames the inline call sites but leaves the top-of-file `use
+     * Univapay\X;` import completely untouched -- see fixupStaleUseImports()'s own doc block in
+     * bin/univapay-migrate for the full empirical write-up. Step 5 (the text-level fixup pass) is
+     * what's actually under test here, not Rector itself.
+     */
+    public function testNestedFunctionUseImportIsFixedUpAfterRector(): void
+    {
+        $dir = $this->makeFixture(<<<'PHP'
+            <?php
+
+            use Univapay\UnivapayClient;
+
+            function outer_init() {
+                function inner_use() {
+                    $client = new UnivapayClient('token', 'secret');
+                    return $client;
+                }
+            }
+
+            PHP);
+
+        [$exitCode, $output] = $this->runMigrate($dir, []);
+        $this->assertSame(0, $exitCode, $output);
+
+        $rewritten = file_get_contents($dir . '/src/Fixture.php');
+        $this->assertStringContainsString(
+            'use Univapay\\Compat\\UnivapayClient;',
+            $rewritten,
+            "the use-import must be renamed to Compat\\, not left dangling:\n{$rewritten}"
+        );
+        $this->assertStringNotContainsString(
+            "use Univapay\\UnivapayClient;\n",
+            $rewritten,
+            "the OLD use-import must not survive the fixup pass:\n{$rewritten}"
+        );
+
+        $report = $this->readReport($dir);
+        $this->assertSame(
+            [],
+            $report['residualReferences'],
+            "the fixed-up use-import must not still show up as a residual SDK reference:\n{$output}"
+        );
+    }
+
+    /**
+     * Regression test for a real gap found migrating a WordPress plugin: its composer.json has
+     * no `autoload`/`autoload-dev` PSR-4 or classmap section at all (common for WP-plugin-style
+     * and other legacy layouts that autoload via a plugin-loader file instead), and its code
+     * lives at the project root / under `includes/`, not the conventional `src/` this script used
+     * to fall back to. Without `--paths`, resolvePaths() used to return `[]` and the whole run
+     * failed with "Could not determine which paths to scan." discoverPathsByReference() is the
+     * fix under test here: a cheap whole-project sweep for any file that actually references
+     * `Univapay\`.
+     */
+    public function testPathsAreAutoDiscoveredWithNoAutoloadSectionAndNoSrcDirectory(): void
+    {
+        $dir = sys_get_temp_dir() . '/univapay-migrate-flags-' . bin2hex(random_bytes(8));
+        $this->tempDirs[] = $dir;
+
+        mkdir($dir, 0777, true);
+        mkdir($dir . '/includes', 0777, true);
+        file_put_contents(
+            $dir . '/includes/Fixture.php',
+            <<<'PHP'
+            <?php
+
+            use Univapay\UnivapayClient;
+
+            class Fixture
+            {
+                public function run(): UnivapayClient
+                {
+                    return new UnivapayClient('token', 'secret');
+                }
+            }
+
+            PHP
+        );
+
+        // Deliberately no `autoload`/`autoload-dev` section at all.
+        file_put_contents(
+            $dir . '/composer.json',
+            json_encode(
+                [
+                    'name' => 'e2e/fixture-consumer-no-autoload',
+                    'require' => [
+                        'php' => '^7.2',
+                        'univapay/php-sdk' => '^1.0',
+                    ],
+                ],
+                JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES
+            ) . "\n"
+        );
+
+        mkdir($dir . '/vendor', 0777, true);
+        file_put_contents(
+            $dir . '/vendor/autoload.php',
+            <<<'PHP'
+            <?php
+
+            namespace Univapay {
+                if (!class_exists(__NAMESPACE__ . '\\UnivapayClient', false)) {
+                    class UnivapayClient
+                    {
+                    }
+                }
+            }
+
+            PHP
+        );
+
+        // Unlike runMigrate(), deliberately do NOT pass --paths -- that's the exact thing under
+        // test: resolvePaths() must discover `includes/` on its own.
+        $bin = self::PACKAGE_ROOT . '/bin/univapay-migrate';
+        $descriptorSpec = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+        $process = proc_open([PHP_BINARY, $bin, '--skip-composer'], $descriptorSpec, $pipes, $dir);
+        $this->assertIsResource($process, 'failed to start bin/univapay-migrate subprocess');
+        fclose($pipes[0]);
+        $stdout = stream_get_contents($pipes[1]) ?: '';
+        $stderr = stream_get_contents($pipes[2]) ?: '';
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        $exitCode = proc_close($process);
+        $output = $stdout . $stderr;
+
+        $this->assertSame(0, $exitCode, $output);
+        $this->assertStringContainsString('paths: includes', $output, $output);
+
+        $rewritten = file_get_contents($dir . '/includes/Fixture.php');
+        $this->assertStringContainsString('use Univapay\\Compat\\UnivapayClient;', $rewritten, $rewritten);
+    }
+
+    /**
+     * Regression test for a real, more serious bug the previous test's fixture (a subdirectory,
+     * `includes/`) didn't happen to exercise: `discoverPathsByReference()` can return a bare
+     * FILE path directly (a root-level plugin-loader file, exactly the shape of a real
+     * WordPress plugin's main .php file -- verified empirically). `collectFiles()`, shared by
+     * both the step-7 residual scanner and the step-5 use-import fixup, used to guard on
+     * `is_dir()` alone and silently skip any path that was a file instead of a directory -- no
+     * error, no warning, just silently never looking inside that file at all. That made both
+     * safety nets no-op on exactly the file most likely to need them in a WP-plugin-style
+     * project with no `src/`.
+     */
+    public function testCollectFilesHandlesABareRootLevelFilePathNotJustDirectories(): void
+    {
+        $dir = sys_get_temp_dir() . '/univapay-migrate-flags-' . bin2hex(random_bytes(8));
+        $this->tempDirs[] = $dir;
+
+        mkdir($dir, 0777, true);
+        // No subdirectory at all -- the fixture file sits directly at the project root, same as
+        // a WordPress plugin's main loader file.
+        file_put_contents(
+            $dir . '/plugin-loader.php',
+            <<<'PHP'
+            <?php
+
+            use Univapay\UnivapayClient;
+
+            function outer_init() {
+                function inner_use() {
+                    return new UnivapayClient('token', 'secret');
+                }
+            }
+
+            PHP
+        );
+
+        file_put_contents(
+            $dir . '/composer.json',
+            json_encode(
+                [
+                    'name' => 'e2e/fixture-consumer-root-file',
+                    'require' => [
+                        'php' => '^7.2',
+                        'univapay/php-sdk' => '^1.0',
+                    ],
+                ],
+                JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES
+            ) . "\n"
+        );
+
+        mkdir($dir . '/vendor', 0777, true);
+        file_put_contents(
+            $dir . '/vendor/autoload.php',
+            <<<'PHP'
+            <?php
+
+            namespace Univapay {
+                if (!class_exists(__NAMESPACE__ . '\\UnivapayClient', false)) {
+                    class UnivapayClient
+                    {
+                    }
+                }
+            }
+
+            PHP
+        );
+
+        $bin = self::PACKAGE_ROOT . '/bin/univapay-migrate';
+        $descriptorSpec = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+        $process = proc_open([PHP_BINARY, $bin, '--skip-composer'], $descriptorSpec, $pipes, $dir);
+        $this->assertIsResource($process, 'failed to start bin/univapay-migrate subprocess');
+        fclose($pipes[0]);
+        $stdout = stream_get_contents($pipes[1]) ?: '';
+        $stderr = stream_get_contents($pipes[2]) ?: '';
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        $exitCode = proc_close($process);
+        $output = $stdout . $stderr;
+
+        $this->assertSame(0, $exitCode, $output);
+        $this->assertStringContainsString('paths: plugin-loader.php', $output, $output);
+
+        $rewritten = file_get_contents($dir . '/plugin-loader.php');
+        $this->assertStringContainsString(
+            'use Univapay\\Compat\\UnivapayClient;',
+            $rewritten,
+            "the use-import in a bare root-level file must be fixed up, not silently skipped:\n{$rewritten}"
+        );
+        $this->assertStringNotContainsString("use Univapay\\UnivapayClient;\n", $rewritten, $rewritten);
+
+        $report = $this->readReport($dir);
+        $this->assertSame(
+            [],
+            $report['residualReferences'],
+            "the residual scanner must also look inside a bare root-level file path:\n{$output}"
+        );
+    }
+
     // -------------------------------------------------------------------
     // Fixture consumer-project scaffold (same shape as GoldenMigrationTest's)
     // -------------------------------------------------------------------
