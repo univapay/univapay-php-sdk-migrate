@@ -26,4 +26,15 @@ final class UnivapaySetList
      * @var string
      */
     public const PHP_SDK_TO_COMPAT = __DIR__ . '/../config/sets/php-sdk-to-compat.php';
+
+    /**
+     * The second-hop set that flags (and, where NativeClassMap::SUPPORTED ever gains entries,
+     * renames) `univapay/univapay-sdk-compat` usages against the native, APIMatic-generated
+     * `univapay/client-sdk`. Review-assisted, not drop-in -- see NativeClassMap's own doc block.
+     * Invoked via `bin/univapay-migrate --phase2` (a separate, non-mutating-by-default
+     * invocation; see that script's own doc comment for the full step order).
+     *
+     * @var string
+     */
+    public const COMPAT_TO_NATIVE = __DIR__ . '/../config/sets/compat-to-native.php';
 }
