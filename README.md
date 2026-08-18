@@ -65,6 +65,7 @@ Rector must run before the old SDK is removed.
 | `--skip-composer` | Skips the `composer require univapay/univapay-sdk-compat` and `composer remove univapay/php-sdk` steps entirely — for monorepos or CI pipelines that manage those two dependency changes themselves. Rector still requires the old SDK to be autoloadable at run time regardless. |
 | `--paths=a,b,c` | Comma-separated directories to scan. If omitted, derived from your `composer.json`'s `autoload`/`autoload-dev` PSR-4 (and classmap) entries, falling back to `src/` if none are declared. |
 | `--no-report` | Skips writing `univapay-migrate-report.json` to the current working directory. Written by default — see "Exit codes + report" below. |
+| `--phase2` | Runs the SECOND, independent migration — `univapay/univapay-sdk-compat` onto the native `univapay/client-sdk` — instead of this default set. Never touches `composer.json`. See "Migrating further to the native SDK" below. |
 | `-h`, `--help` | Prints usage and exits. |
 
 ### Before / after
@@ -292,10 +293,55 @@ paths share one engine, so there is no drift between them during the migration w
 [`univapay-sdk-compat` README](https://github.com/univapay/univapay-php-sdk-compat#migrating-off-the-compat-layer)
 for the full mixed-mode pattern and its own construct-by-construct migration notes.
 
-A future `UnivapaySetList::COMPAT_TO_NATIVE` Rector set in this package will cover the
-mechanical subset of that second migration (namespace-only renames for 1:1 data shapes, exception
-class renames) — review-assisted, not zero-review, since enum identity and public-property access
-still need a human decision when moving off compat's API shape entirely.
+### Phase 2: `--phase2`
+
+```bash
+vendor/bin/univapay-migrate --phase2
+```
+
+Runs `UnivapaySetList::COMPAT_TO_NATIVE` instead of the default set. **Review-assisted, not
+drop-in.** An audit of both trees (`univapay/univapay-sdk-compat`'s `src/` against the native
+`univapay/client-sdk`'s `src/Models`) found zero data classes and zero exception classes safe to
+rename mechanically — every compat resource uses public properties where native models use
+private properties behind getters, every compat enum is a `TypedEnum` singleton where native enums
+are plain string `const`s, and every compat exception subclass would collapse many-to-one onto
+`UnivaPay\Exceptions\ApiException`/`ApiErrorException`. So instead of a rename map, this set's one
+rule (`FlagCompatManualMigrationRector`) inserts an idempotent `//
+@univapay-migrate:phase2-manual` marker comment above every construct that needs a human decision,
+naming its category and the native equivalent:
+
+| Category | Compat construct | Native equivalent |
+|---|---|---|
+| `typed-enum` | `ChargeStatus::SUCCESSFUL()`, `->getValue()`, `===`, `switch` | `UnivaPay\Models\ChargeStatus::SUCCESSFUL` (plain string `const`) |
+| `money` | `Money\Money`/`Money\Currency` (moneyphp) | flat `int $amount` + `string $currency` |
+| `public-property` | `$charge->status` | `$charge->getStatus()` / `->getResult()->getStatus()` on an `ApiResponse` |
+| `poll` | `->awaitResult()` | `pollCharge()`/`pollRefund()`/`pollCancel()`/`pollSubscription()` |
+| `pagination` | `Paginated`, `->getNext()`/`->getPrevious()`, the `Mixins\Get*` traits | a cursor-param loop against the native list endpoint |
+| `webhook` | `->parseWebhookData()` | `UnivaPay\Events\Webhooks\*Handler` |
+| `client-construction` | `UnivapayClient`/`UnivapayClientOptions`, `AppJWT`/`StoreAppJWT`/`MerchantAppJWT` | `UnivapayClientSdkClientBuilder` + `BearerAuthCredentialsBuilder` |
+| `exception-handling` | any `Univapay\Compat\Errors\*` catch/throw/`instanceof` | `ApiException`/`ApiErrorException`, distinguished via `getHttpResponse()->getStatusCode()`/`getCodeProperty()` |
+| `internal-utility` | `Univapay\Compat\Utility\*` | none — port the logic yourself |
+
+`->native()` (the documented mixed-mode escape hatch above) is never flagged.
+
+**Inputs:** the same `--paths`/`--dry-run`/`--strict`/`--allow-unsupported`/`--no-report` flags as
+the default set, applied to the same `@univapay-migrate:phase2-manual` markers instead of
+`@univapay-migrate:unsupported` ones. `--skip-composer` has no effect here — see Outputs.
+
+**Outputs:** `--phase2` **never modifies `composer.json` itself.** Steps 2 and 6 (`composer
+require`/`composer remove`) are always skipped and printed as next steps instead:
+
+```bash
+composer require univapay/client-sdk
+composer remove univapay/univapay-sdk-compat
+```
+
+Preflight checks `Univapay\Compat\UnivapayClient` is autoloadable (compat must be installed —
+there is nothing to migrate from otherwise), not the old SDK's client. The report's fourth section
+and `univapay-migrate-report.json`'s `"phase2Manual"` array work exactly like the
+unsupported-feature section: `"verified": true` for a confirmed flag, `false` for an
+unresolved-receiver `(verify)` flag, and the same exit-code precedence (`--strict` promotes
+`(verify)` to a failure, `--allow-unsupported` downgrades either back to `0`).
 
 ## Removing this package afterwards
 
