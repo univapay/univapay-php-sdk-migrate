@@ -323,7 +323,7 @@ compat の enum はすべて `TypedEnum` シングルトンであるのに対し
 | `poll` | `->awaitResult()` | `pollCharge()`/`pollRefund()`/`pollCancel()`/`pollSubscription()` |
 | `pagination` | `Paginated`、`->getNext()`/`->getPrevious()`、`Mixins\Get*` トレイト群 | ネイティブの一覧エンドポイントに対するカーソルパラメータのループ |
 | `webhook` | `->parseWebhookData()` | `UnivaPay\Events\Webhooks\*Handler` |
-| `client-construction` | `UnivapayClient`/`UnivapayClientOptions`、`AppJWT`/`StoreAppJWT`/`MerchantAppJWT` | `UnivapayClientSdkClientBuilder` + `BearerAuthCredentialsBuilder` |
+| `client-construction` | `UnivapayClient`/`UnivapayClientOptions`、`AppJWT`/`StoreAppJWT`/`MerchantAppJWT`、`Requests\Handlers\*` のリトライ/レート制限ハンドラ | `UnivapayClientSdkClientBuilder` + `BearerAuthCredentialsBuilder`、`enableRetries()`/`numberOfRetries()` |
 | `exception-handling` | `Univapay\Compat\Errors\*` の catch/throw/`instanceof` | `ApiException`/`ApiErrorException`。`getHttpResponse()->getStatusCode()`/`getCodeProperty()` で区別 |
 | `internal-utility` | `Univapay\Compat\Utility\*` | 対応なし —— 自前でロジックを移植してください |
 

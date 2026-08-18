@@ -154,6 +154,15 @@ final class NativeClassMap
         'Univapay\Compat\Resources\Authentication\\' => 'client-construction',
         'Univapay\Compat\Resources\Mixins\\' => 'pagination',
         'Univapay\Compat\Utility\\' => 'internal-utility',
+        // BasicRetryHandler/NetworkRetryHandler/RateLimitHandler/RequestHandler configure the
+        // compat client's retry cascade (constructor args to UnivapayClientOptions) -- the native
+        // equivalent is client-construction-time config (UnivapayClientSdkClientBuilder's
+        // enableRetries()/numberOfRetries()), so this folds into the same category rather than
+        // getting its own. Sibling of `Resources\` below, not nested under it (`Requests\` is a
+        // top-level sub-namespace of its own) -- found during the audit alongside the Resources\*
+        // sweep; without this entry a consumer's custom retry-handler wiring would silently pass
+        // through with no flag at all.
+        'Univapay\Compat\Requests\Handlers\\' => 'client-construction',
         // General fallback for any other Resources\* class reference (Name nodes: use, new,
         // instanceof, type hints, catch, ::class) not already caught by a more specific prefix
         // above -- e.g. `Univapay\Compat\Resources\Charge`, `Resources\PaymentMethod\CardPayment`,
@@ -225,10 +234,13 @@ final class NativeClassMap
             . 'RefundHandler, CancelHandler, SubscriptionHandler, TokenHandler, '
             . 'BankTransferHandler, CustomsHandler), which parses and validates the payload '
             . 'directly instead of returning an old-SDK-shaped WebhookPayload.',
-        'client-construction' => 'UnivapayClient/UnivapayClientOptions construction and '
-            . 'AppJWT/StoreAppJWT/MerchantAppJWT token building have no native equivalent -- '
-            . 'replace with UnivaPay\UnivapayClientSdkClientBuilder::init()->...->build() plus '
-            . 'UnivaPay\Authentication\BearerAuthCredentialsBuilder::init($secretKey, $jwtToken).',
+        'client-construction' => 'UnivapayClient/UnivapayClientOptions construction, '
+            . 'AppJWT/StoreAppJWT/MerchantAppJWT token building, and the Requests\Handlers\* '
+            . 'retry/rate-limit handler classes have no native equivalent -- replace client/token '
+            . 'construction with UnivaPay\UnivapayClientSdkClientBuilder::init()->...->build() '
+            . 'plus UnivaPay\Authentication\BearerAuthCredentialsBuilder::init($secretKey, '
+            . '$jwtToken), and replace custom retry-handler wiring with the builder\'s own '
+            . 'enableRetries()/numberOfRetries() configuration.',
         'exception-handling' => 'This compat exception class has no 1:1 native equivalent -- the '
             . 'native SDK throws only UnivaPay\Exceptions\ApiException (network failures or a '
             . 'non-OK status with no parseable body) and UnivaPay\Exceptions\ApiErrorException '

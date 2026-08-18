@@ -318,7 +318,7 @@ naming its category and the native equivalent:
 | `poll` | `->awaitResult()` | `pollCharge()`/`pollRefund()`/`pollCancel()`/`pollSubscription()` |
 | `pagination` | `Paginated`, `->getNext()`/`->getPrevious()`, the `Mixins\Get*` traits | a cursor-param loop against the native list endpoint |
 | `webhook` | `->parseWebhookData()` | `UnivaPay\Events\Webhooks\*Handler` |
-| `client-construction` | `UnivapayClient`/`UnivapayClientOptions`, `AppJWT`/`StoreAppJWT`/`MerchantAppJWT` | `UnivapayClientSdkClientBuilder` + `BearerAuthCredentialsBuilder` |
+| `client-construction` | `UnivapayClient`/`UnivapayClientOptions`, `AppJWT`/`StoreAppJWT`/`MerchantAppJWT`, `Requests\Handlers\*` retry/rate-limit handlers | `UnivapayClientSdkClientBuilder` + `BearerAuthCredentialsBuilder`, `enableRetries()`/`numberOfRetries()` |
 | `exception-handling` | any `Univapay\Compat\Errors\*` catch/throw/`instanceof` | `ApiException`/`ApiErrorException`, distinguished via `getHttpResponse()->getStatusCode()`/`getCodeProperty()` |
 | `internal-utility` | `Univapay\Compat\Utility\*` | none — port the logic yourself |
 
