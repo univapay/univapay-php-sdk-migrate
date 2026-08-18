@@ -1,0 +1,38 @@
+{
+    "name": "univapay/univapay-sdk-migrate",
+    "description": "Rector ruleset that mechanically migrates univapay/php-sdk consumers to univapay/univapay-sdk-compat. require-dev only, removable after migration.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": [
+        "univapay",
+        "rector",
+        "migration",
+        "codemod"
+    ],
+    "homepage": "https://github.com/univapay/univapay-php-sdk-migrate",
+    "require": {
+        "php": "^7.4 || ^8.0",
+        "rector/rector": "2.6.2"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^9.6"
+    },
+    "autoload": {
+        "psr-4": {
+            "Univapay\\Migrate\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Univapay\\Migrate\\Tests\\": "tests/"
+        }
+    },
+    "bin": [
+        "bin/univapay-migrate"
+    ],
+    "minimum-stability": "stable",
+    "prefer-stable": true,
+    "config": {
+        "sort-packages": true
+    }
+}

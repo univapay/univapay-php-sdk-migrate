@@ -1,0 +1,10 @@
+/vendor/
+/var/
+/composer.lock
+.phpunit.result.cache
+.phpunit.cache/
+
+# scripts/e2e-execution.sh's default output location (tests/E2e/ExecutionTest.php points
+# E2E_RESULTS_PATH at its own tmp file instead, but a manual/local run without that env var set
+# writes here).
+/tests/E2e/execution-results.json

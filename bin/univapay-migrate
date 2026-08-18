@@ -1,0 +1,1015 @@
+#!/usr/bin/env php
+<?php
+
+/**
+ * univapay-migrate: the one command that migrates a consumer's codebase from
+ * `univapay/php-sdk` to `univapay/univapay-sdk-compat` via a Rector ruleset.
+ *
+ * Dependency-free by design (no symfony/console) -- this is the only script most consumers will
+ * ever run from this package, and it must work with nothing more than the PHP binary and a
+ * working Composer installation.
+ *
+ * Fixed step order (do not reorder):
+ *   1. Preflight checks (composer.json exists, transitive-dependency guard, autoloadability,
+ *      platform sanity).
+ *   2. `composer require univapay/univapay-sdk-compat` -- BEFORE running Rector.
+ *   3. Materialize `rector-univapay.php` from the packaged template.
+ *   4. Run Rector -- the old SDK MUST still be installed at this point, or PHPStan's receiver
+ *      type resolution goes blind and every unsupported-feature flag degrades to `(verify)`.
+ *   5. `composer remove univapay/php-sdk` -- only now, after the rewrite.
+ *   6. Three-section post-scan (markers / residual `Univapay\` scan / known dead imports).
+ *   7. Exit 0 clean, 2 on confirmed unsupported-feature flags (or `--strict` + any `(verify)`
+ *      flag), otherwise 0 with warnings printed.
+ *   8. Print next-steps.
+ *
+ * `--skip-composer`: skips the two *mutating* Composer calls in steps 2 and 5 (`composer
+ * require`/`composer remove`) entirely -- everything else in the fixed order above still runs
+ * unchanged, including preflight's (non-mutating, offline) `composer why`/`check-platform-reqs`
+ * calls. Two real audiences: (a) the E2E golden test harness (tests/E2e/GoldenMigrationTest.php),
+ * which must not depend on `univapay/univapay-sdk-compat` actually being published on Packagist
+ * yet, or on network access at all, to exercise the rest of this script end-to-end; (b) consumers
+ * who manage the compat/old-SDK require themselves (e.g. a monorepo with a shared root lockfile,
+ * or a CI pipeline that stages the composer.json diff separately from running codemods) -- they
+ * are responsible for ensuring `univapay/univapay-sdk-compat` is present and `univapay/php-sdk` is
+ * removed appropriately around this invocation. Step 4 still requires the old SDK to be
+ * autoloadable at Rector-run time either way (see preflight); `--skip-composer` does not relax
+ * that, it only skips the two composer mutations this script would otherwise perform itself.
+ *
+ * `--allow-unsupported`: downgrades an unsupported-feature exit (2) to 0 -- for CI pipelines that
+ * have reviewed the findings and consciously accept them rather than gating on them. Precedence
+ * versus `--strict`: `--allow-unsupported` downgrades BOTH a confirmed unsupported-feature exit
+ * AND a `--strict`-promoted `(verify)` exit to 0. It is evaluated last, after `--strict`
+ * promotion, so passing both together always nets out to exit 0 for unsupported-feature-only
+ * findings -- it is never shadowed by `--strict`. It never changes what gets printed or written
+ * to the JSON report (see below), only the process exit code.
+ *
+ * `univapay-migrate-report.json`: step 6 additionally writes a machine-readable mirror of the
+ * same three-section report to this file in the consumer's cwd, built from the exact same
+ * in-memory arrays `printReport()` prints from (see `postScan()`) -- never a second scan.
+ * `--no-report` suppresses the write entirely.
+ */
+
+declare(strict_types=1);
+
+// ---------------------------------------------------------------------------
+// Bootstrap: locate this package's own root (works both as a vendor/bin shim
+// and when run directly from a checkout), independent of the consumer's cwd.
+// ---------------------------------------------------------------------------
+
+$packageRoot = dirname(__DIR__);
+$templatePath = $packageRoot . '/config/rector-template.php';
+
+const EXIT_CLEAN = 0;
+const EXIT_USAGE_ERROR = 1;
+const EXIT_UNSUPPORTED_FLAGS = 2;
+
+const DEAD_IMPORTS = [
+    // FQCNs that look plausible from old README snippets but never existed in the real
+    // univapay/php-sdk tree. Never map these (mapping them would emit a second `use` line for
+    // an FQCN that's already imported correctly elsewhere, or for one with no real target at
+    // all -> both are compile errors). Report as "dead import, safe to delete" instead.
+    'Univapay\\Client',
+    'Univapay\\RequestsHandlers',
+    'Univapay\\PaymentMethod\\CardPayment',
+];
+
+const MARKER_UNSUPPORTED = '@univapay-migrate:unsupported';
+const MARKER_INTERNAL_API = '@univapay-migrate:internal-api';
+// Alongside FlagInternalApiUsageRector's WpOrg\Requests\* fold-in (see
+// config/sets/php-sdk-to-compat.php): any WpOrg\Requests\* reference becomes dead after
+// migration (new transport throws UnivapayNetworkError, never a WpOrg\Requests\Exception), so it
+// gets its own counted post-scan category distinct from internal-api.
+const MARKER_NETWORK_EXCEPTION = '@univapay-migrate:network-exception';
+const VERIFY_SUFFIX = '(verify)';
+
+const REPORT_FILENAME = 'univapay-migrate-report.json';
+const REPORT_VERSION = 1;
+
+const DEFAULT_EXCLUDED_DIRS = ['vendor', 'var', 'storage', 'node_modules'];
+const DEFAULT_EXCLUDED_EXTENSIONS = ['blade.php', 'twig'];
+
+// File extensions the residual `Univapay\` scan inspects. Deliberately broad: string FQCNs hide
+// in DI configs, serializer mappings, and static-analysis baselines just as often as in PHP.
+const RESIDUAL_SCAN_EXTENSIONS = [
+    'php', 'yml', 'yaml', 'xml', 'json', 'neon', 'env', 'twig', 'blade.php', 'ini',
+];
+
+// ---------------------------------------------------------------------------
+// PHP 7.4-safe string helpers.
+//
+// This package's own composer.json floor is "^7.4 || ^8.0" (Decision 1 in DECISIONS.md), so this
+// script must run correctly under plain PHP 7.4 -- str_starts_with()/str_ends_with()/
+// str_contains() are PHP 8.0+ only and must not be used directly here.
+// ---------------------------------------------------------------------------
+
+function uvStartsWith(string $haystack, string $needle): bool
+{
+    return $needle === '' || strncmp($haystack, $needle, strlen($needle)) === 0;
+}
+
+function uvEndsWith(string $haystack, string $needle): bool
+{
+    return $needle === '' || substr($haystack, -strlen($needle)) === $needle;
+}
+
+function uvContains(string $haystack, string $needle): bool
+{
+    return $needle === '' || strpos($haystack, $needle) !== false;
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+function main(array $argv): int
+{
+    global $templatePath, $packageRoot;
+
+    $options = parseArgs(array_slice($argv, 1));
+    if ($options === null) {
+        return EXIT_USAGE_ERROR;
+    }
+    if ($options['help']) {
+        printUsage();
+        return EXIT_CLEAN;
+    }
+
+    $cwd = getcwd();
+    if ($cwd === false) {
+        fwrite(STDERR, "Could not determine current working directory.\n");
+        return EXIT_USAGE_ERROR;
+    }
+
+    echo "univapay-migrate\n";
+    echo "consumer project: {$cwd}\n";
+    if ($options['dryRun']) {
+        echo "mode: --dry-run (no mutating commands will actually run)\n";
+    }
+    if ($options['skipComposer']) {
+        echo "mode: --skip-composer (composer require/remove steps 2 and 5 are skipped)\n";
+    }
+    if ($options['allowUnsupported']) {
+        echo "mode: --allow-unsupported (unsupported-feature exit 2 is downgraded to 0)\n";
+    }
+    if ($options['noReport']) {
+        echo "mode: --no-report (" . REPORT_FILENAME . " will not be written)\n";
+    }
+    echo "\n";
+
+    // --- Step 1: preflight -----------------------------------------------
+    echo "== Step 1/6: preflight ==\n";
+    $preflight = preflight($cwd, $options);
+    if (!$preflight['ok']) {
+        fwrite(STDERR, "\nPreflight failed: {$preflight['reason']}\n");
+        return EXIT_USAGE_ERROR;
+    }
+    echo "preflight OK\n\n";
+
+    // --- Step 2: require compat -------------------------------------------
+    echo "== Step 2/6: require univapay/univapay-sdk-compat ==\n";
+    if ($options['skipComposer']) {
+        echo "[skip-composer] skipping composer require univapay/univapay-sdk-compat -- assumed " .
+            "already satisfied or managed externally.\n";
+    } else {
+        $exit = runCommand(
+            ['composer', 'require', 'univapay/univapay-sdk-compat:^1.0'],
+            $cwd,
+            $options['dryRun'],
+            'composer require'
+        );
+        if ($exit !== 0) {
+            fwrite(STDERR, "\ncomposer require failed (exit {$exit}). Aborting before any rewrite.\n");
+            return EXIT_USAGE_ERROR;
+        }
+    }
+    echo "\n";
+
+    // --- Step 3: materialize rector config ---------------------------------
+    echo "== Step 3/6: materialize rector-univapay.php ==\n";
+    $paths = resolvePaths($cwd, $options['paths']);
+    if ($paths === []) {
+        fwrite(STDERR, "Could not determine which paths to scan. Pass --paths=<dir1>,<dir2>.\n");
+        return EXIT_USAGE_ERROR;
+    }
+    echo "paths: " . implode(', ', $paths) . "\n";
+    $configPath = $cwd . '/rector-univapay.php';
+    // Always materialize the config, even under --dry-run: unlike the composer require/remove
+    // steps, writing this local scratch file has no consequence for the consumer's dependency
+    // state, and Rector needs it to exist to run `process --dry-run` at all in step 4.
+    materializeConfig($templatePath, $configPath, $paths);
+    echo "wrote {$configPath}\n";
+    echo "\n";
+
+    // --- Step 4: run rector (old SDK STILL installed) ----------------------
+    echo "== Step 4/6: run rector (old SDK still installed -- required for receiver typing) ==\n";
+    $rectorBin = resolveRectorBin($cwd, $packageRoot);
+    $rectorCommand = [
+        $rectorBin,
+        'process',
+        '--config',
+        'rector-univapay.php',
+        '--clear-cache',
+    ];
+    if ($options['dryRun']) {
+        $rectorCommand[] = '--dry-run';
+    }
+    $exit = runCommand($rectorCommand, $cwd, false, 'vendor/bin/rector process');
+    // Rector's own --dry-run flag reports the diff without writing; we still "run" it (not
+    // skipped like other steps) so a --dry-run invocation of this script tells the operator what
+    // Rector would change.
+    if ($exit !== 0 && $exit !== 2) {
+        // Rector itself exits 2 when it *would* change files under --dry-run; only treat other
+        // non-zero codes as hard failures.
+        fwrite(STDERR, "\nrector process failed (exit {$exit}). Aborting before old SDK removal.\n");
+        return EXIT_USAGE_ERROR;
+    }
+    echo "\n";
+
+    // --- Step 5: remove old SDK ---------------------------------------------
+    echo "== Step 5/6: remove univapay/php-sdk ==\n";
+    if ($options['skipComposer']) {
+        echo "[skip-composer] skipping composer remove univapay/php-sdk -- managed externally.\n";
+    } else {
+        $exit = runCommand(
+            ['composer', 'remove', 'univapay/php-sdk'],
+            $cwd,
+            $options['dryRun'],
+            'composer remove'
+        );
+        if ($exit !== 0) {
+            fwrite(
+                STDERR,
+                "\ncomposer remove failed (exit {$exit}). Code has been rewritten but the old " .
+                "package is still required -- resolve manually and re-run `composer remove " .
+                "univapay/php-sdk`.\n"
+            );
+            return EXIT_USAGE_ERROR;
+        }
+    }
+    echo "\n";
+
+    // --- Step 6: post-scan ---------------------------------------------------
+    echo "== Step 6/6: post-scan report ==\n";
+    $report = postScan($cwd, $paths);
+    printReport($report);
+
+    printNextSteps($cwd);
+
+    $hasConfirmedUnsupported = countUnsupported($report['unsupported'], true) > 0;
+    $hasVerifyUnsupported = countUnsupported($report['unsupported'], false) > 0;
+
+    // Precedence: --strict promotes a "(verify)" flag to the same failing condition a confirmed
+    // flag already is; --allow-unsupported is evaluated LAST and downgrades either failing
+    // condition back to 0. The two compose rather than fight -- passing both together always
+    // nets out to exit 0 for unsupported-feature-only findings.
+    $wouldFailOnUnsupported = $hasConfirmedUnsupported || ($hasVerifyUnsupported && $options['strict']);
+
+    $exitCode = EXIT_CLEAN;
+    if ($wouldFailOnUnsupported) {
+        $exitCode = $options['allowUnsupported'] ? EXIT_CLEAN : EXIT_UNSUPPORTED_FLAGS;
+    }
+
+    if ($wouldFailOnUnsupported && $options['allowUnsupported']) {
+        echo "--allow-unsupported: downgrading unsupported-feature exit code " .
+            EXIT_UNSUPPORTED_FLAGS . " -> " . EXIT_CLEAN . " (findings above are unchanged).\n\n";
+    }
+
+    if (!$options['noReport']) {
+        writeJsonReport($cwd, $report, $exitCode);
+        echo "wrote " . REPORT_FILENAME . "\n\n";
+    }
+
+    return $exitCode;
+}
+
+/**
+ * @param array<int, array{file: string, line: int, feature: string, verified: bool}> $unsupported
+ */
+function countUnsupported(array $unsupported, bool $verified): int
+{
+    $count = 0;
+    foreach ($unsupported as $entry) {
+        if ($entry['verified'] === $verified) {
+            $count++;
+        }
+    }
+    return $count;
+}
+
+// ---------------------------------------------------------------------------
+// Argument parsing
+// ---------------------------------------------------------------------------
+
+/**
+ * @param string[] $args
+ * @return array{dryRun: bool, strict: bool, skipComposer: bool, allowUnsupported: bool, noReport: bool, paths: string[], help: bool}|null
+ */
+function parseArgs(array $args): ?array
+{
+    $options = [
+        'dryRun' => false,
+        'strict' => false,
+        'skipComposer' => false,
+        'allowUnsupported' => false,
+        'noReport' => false,
+        'paths' => [],
+        'help' => false,
+    ];
+
+    foreach ($args as $arg) {
+        if ($arg === '--dry-run') {
+            $options['dryRun'] = true;
+            continue;
+        }
+        if ($arg === '--strict') {
+            $options['strict'] = true;
+            continue;
+        }
+        if ($arg === '--skip-composer') {
+            $options['skipComposer'] = true;
+            continue;
+        }
+        if ($arg === '--allow-unsupported') {
+            $options['allowUnsupported'] = true;
+            continue;
+        }
+        if ($arg === '--no-report') {
+            $options['noReport'] = true;
+            continue;
+        }
+        if ($arg === '-h' || $arg === '--help') {
+            $options['help'] = true;
+            continue;
+        }
+        if (uvStartsWith($arg, '--paths=')) {
+            $value = substr($arg, strlen('--paths='));
+            $options['paths'] = array_values(array_filter(array_map('trim', explode(',', $value))));
+            continue;
+        }
+
+        fwrite(STDERR, "Unknown argument: {$arg}\n\n");
+        printUsage();
+        return null;
+    }
+
+    return $options;
+}
+
+function printUsage(): void
+{
+    echo <<<'USAGE'
+Usage: univapay-migrate [options]
+
+Migrates a consumer codebase from univapay/php-sdk to univapay/univapay-sdk-compat,
+via a Rector ruleset that renames namespaces and flags unsupported/internal-API usage.
+
+Options:
+  --dry-run          Do not run any mutating command (composer require/remove) and pass
+                      --dry-run through to `rector process`. Still writes a report.
+  --strict           Promote unresolved-receiver "(verify)" flags to a hard failure
+                      (exit 2). By default only confirmed unsupported-feature flags do.
+  --allow-unsupported Downgrade an unsupported-feature exit (2) to 0. Precedence versus --strict:
+                      this downgrades BOTH a confirmed unsupported-feature exit AND a
+                      --strict-promoted "(verify)" exit -- it is evaluated last, so passing both
+                      flags together always nets out to exit 0 for unsupported-feature-only
+                      findings. Findings are still fully printed and still written to the JSON
+                      report (see --no-report); only the process exit code changes. For CI
+                      pipelines that have reviewed the findings and consciously accept them.
+  --skip-composer     Skip the `composer require univapay/univapay-sdk-compat` (step 2) and
+                      `composer remove univapay/php-sdk` (step 5) calls entirely. Use when those
+                      are managed externally (e.g. a shared monorepo lockfile) or when running
+                      this tool against a fixture project with no real package registry access.
+                      Rector (step 4) still requires the old SDK to be autoloadable regardless.
+  --paths=a,b,c       Comma-separated list of directories to scan. If omitted, derived from
+                      the consumer's composer.json autoload/autoload-dev PSR-4 paths.
+  --no-report         Do not write univapay-migrate-report.json to the current working directory
+                      after the post-scan. Written by default (see "Report file" below).
+  -h, --help          Show this help text.
+
+Exit codes:
+  0   Clean run, only warnings (without --strict), or --allow-unsupported downgraded what would
+      otherwise have been exit 2.
+  1   Usage error or a preflight/step failure -- nothing (or only partial work) was done.
+  2   Confirmed unsupported-feature flags found (or --strict promoted "(verify)" flags), unless
+      --allow-unsupported downgraded it to 0.
+
+Report file:
+  Unless --no-report is passed, step 6 also writes univapay-migrate-report.json to the current
+  working directory: {"version": 1, "exitCode": N, "unsupported": [...], "internalApi": [...],
+  "networkException": [...], "residualReferences": [...], "deadImports": [...]}, mirroring the
+  same stdout report -- "exitCode" is the FINAL exit code this invocation returns (i.e. already
+  reflecting any --allow-unsupported downgrade).
+
+USAGE;
+}
+
+// ---------------------------------------------------------------------------
+// Step 1: preflight
+// ---------------------------------------------------------------------------
+
+/**
+ * @return array{ok: bool, reason: string}
+ */
+function preflight(string $cwd, array $options): array
+{
+    $composerJsonPath = $cwd . '/composer.json';
+    if (!is_file($composerJsonPath)) {
+        return ['ok' => false, 'reason' => "no composer.json found in {$cwd}"];
+    }
+    echo "- composer.json found\n";
+
+    $composerJson = readJson($composerJsonPath);
+    if ($composerJson === null) {
+        return ['ok' => false, 'reason' => "composer.json is not valid JSON"];
+    }
+    $rootName = $composerJson['name'] ?? '__root__';
+
+    // Every remaining preflight check (and steps 2/4/5) shells out to `composer`. Verify it is
+    // actually runnable FIRST, so a missing/broken binary is reported as its own clear error
+    // instead of being silently misread as "nothing requires univapay/php-sdk" below.
+    [$composerVersionExit] = runCommandCaptured(['composer', '--version'], $cwd);
+    if ($composerVersionExit !== 0) {
+        return [
+            'ok' => false,
+            'reason' => "the `composer` executable could not be run (is it installed and on PATH?)",
+        ];
+    }
+    echo "- composer executable found\n";
+
+    // --- transitive-dependency guard ---------------------------------------
+    // If any package OTHER than the consumer's own root package requires
+    // univapay/php-sdk, Rector rewriting the ROOT project's code is not enough: the wrapper
+    // package still ships old-SDK-typed code. Abort with guidance rather than silently produce
+    // a half-migrated, still-broken tree.
+    [$whyExit, $whyStdout] = runCommandCaptured(['composer', 'why', 'univapay/php-sdk'], $cwd);
+    if ($whyExit === 0 && trim($whyStdout) !== '') {
+        $offendingRequirers = [];
+        foreach (explode("\n", trim($whyStdout)) as $line) {
+            $line = trim($line);
+            if ($line === '') {
+                continue;
+            }
+            $requirer = preg_split('/\s+/', $line)[0] ?? '';
+            if ($requirer !== '' && $requirer !== $rootName && $requirer !== '__root__') {
+                $offendingRequirers[] = $requirer;
+            }
+        }
+        if ($offendingRequirers !== []) {
+            $offendingRequirers = array_values(array_unique($offendingRequirers));
+            $list = implode(', ', $offendingRequirers);
+            return [
+                'ok' => false,
+                'reason' =>
+                    "univapay/php-sdk is required transitively by: {$list} (not just your own " .
+                    "project). Migrate that wrapper package first, or pass its source via " .
+                    "--paths so Rector rewrites it too before `composer remove` runs. Running " .
+                    "this tool as-is would remove univapay/php-sdk while a dependency still " .
+                    "needs it.",
+            ];
+        }
+        echo "- composer why univapay/php-sdk: only required by the root project\n";
+    } else {
+        echo "- composer why univapay/php-sdk: no requirers found (nothing to guard against)\n";
+    }
+
+    // --- autoloadability assertion -----------------------------------------
+    $autoloadPath = $cwd . '/vendor/autoload.php';
+    if (!is_file($autoloadPath)) {
+        return ['ok' => false, 'reason' => "vendor/autoload.php not found -- run `composer install` first"];
+    }
+    require $autoloadPath;
+    if (!class_exists('Univapay\\UnivapayClient')) {
+        return [
+            'ok' => false,
+            'reason' =>
+                "Univapay\\UnivapayClient is not autoloadable -- univapay/php-sdk does not " .
+                "appear to be installed in this project. Nothing to migrate.",
+        ];
+    }
+    echo "- Univapay\\UnivapayClient is autoloadable (old SDK present)\n";
+
+    // --- platform sanity (ext-curl for apimatic/unirest-php) ---------------
+    // Best-effort / non-fatal: a missing extension here is a real problem, but it's one the
+    // consumer needs to fix on their host regardless of migration, so we warn rather than abort.
+    [$platformExit, $platformOut] = runCommandCaptured(['composer', 'check-platform-reqs'], $cwd);
+    if ($platformExit !== 0 && stripos($platformOut, 'curl') !== false) {
+        echo "- WARNING: composer check-platform-reqs reports a curl-related platform " .
+            "requirement problem. The new SDK's transport (apimatic/unirest-php) requires " .
+            "ext-curl. Continuing, but this should be fixed before running migrated code:\n";
+        echo indentBlock($platformOut) . "\n";
+    } else {
+        echo "- composer check-platform-reqs: ok (or no curl-related issue)\n";
+    }
+
+    return ['ok' => true, 'reason' => ''];
+}
+
+// ---------------------------------------------------------------------------
+// Step 3: path resolution + config materialization
+// ---------------------------------------------------------------------------
+
+/**
+ * @param string[] $explicitPaths
+ * @return string[]
+ */
+function resolvePaths(string $cwd, array $explicitPaths): array
+{
+    if ($explicitPaths !== []) {
+        return $explicitPaths;
+    }
+
+    $composerJson = readJson($cwd . '/composer.json') ?? [];
+    $dirs = [];
+    foreach (['autoload', 'autoload-dev'] as $section) {
+        $psr4 = $composerJson[$section]['psr-4'] ?? [];
+        foreach ($psr4 as $relativeDir) {
+            if (is_string($relativeDir) && $relativeDir !== '') {
+                $dirs[] = rtrim($relativeDir, '/');
+            }
+        }
+        $classmap = $composerJson[$section]['classmap'] ?? [];
+        foreach ($classmap as $relativeDir) {
+            if (is_string($relativeDir) && $relativeDir !== '') {
+                $dirs[] = rtrim($relativeDir, '/');
+            }
+        }
+    }
+
+    $dirs = array_values(array_unique($dirs));
+
+    // Fall back to a conventional `src/` if the composer.json declares no PSR-4/classmap
+    // autoload sections at all (unusual, but not unheard of in small legacy apps).
+    if ($dirs === [] && is_dir($cwd . '/src')) {
+        $dirs = ['src'];
+    }
+
+    return $dirs;
+}
+
+/**
+ * @param string[] $paths
+ */
+function materializeConfig(string $templatePath, string $destinationPath, array $paths): void
+{
+    $template = file_get_contents($templatePath);
+    if ($template === false) {
+        fwrite(STDERR, "Could not read template at {$templatePath}\n");
+        exit(EXIT_USAGE_ERROR);
+    }
+
+    $pathsPhp = implode(",\n", array_map(
+        static fn (string $path): string => '        __DIR__ . ' . var_export('/' . ltrim($path, '/'), true),
+        $paths
+    ));
+
+    $marker = '        // __UNIVAPAY_MIGRATE_PATHS_PLACEHOLDER__' .
+        "\n        // Substituted with the consumer's autoload source directories, derived from " .
+        "their\n        // composer.json `autoload`/`autoload-dev` PSR-4 paths, or from --paths " .
+        "CLI args.";
+    $replacement = $pathsPhp;
+
+    $materialized = str_replace($marker, $replacement, $template);
+    if ($materialized === $template) {
+        fwrite(STDERR, "Warning: path placeholder not found in template; writing template as-is.\n");
+    }
+
+    file_put_contents($destinationPath, $materialized);
+}
+
+/**
+ * Locates the `rector` binary to invoke. Three tiers, in order:
+ *   1. The consumer project's own `vendor/bin/rector` -- the normal case: Composer auto-installs
+ *      bin stubs from every installed package, including transitive require-dev dependencies like
+ *      `rector/rector` pulled in by this package, directly into the ROOT project's `vendor/bin/`.
+ *   2. This package's OWN `vendor/bin/rector` (`$packageRoot/vendor/bin/rector`) -- covers running
+ *      this tool from a source checkout (e.g. the E2E golden test harness in
+ *      tests/E2e/GoldenMigrationTest.php, which deliberately skips the consumer-side `composer
+ *      require`/`install` dance via `--skip-composer`) or any unusual install layout where the
+ *      consumer's own bin-stub sync did not run. Invoking it works regardless of $cwd: the binary
+ *      itself resolves its `vendor/autoload.php` relative to its own location, not the caller's
+ *      cwd, so `Univapay\Migrate\UnivapaySetList` etc. (referenced by the materialized
+ *      rector-univapay.php config) still autoload correctly.
+ *   3. A bare `'vendor/bin/rector'` string, relying on the shell's own PATH resolution -- a final,
+ *      rarely-hit defensive fallback.
+ */
+function resolveRectorBin(string $cwd, string $packageRoot): string
+{
+    $consumerBin = $cwd . '/vendor/bin/rector';
+    if (file_exists($consumerBin)) {
+        return $consumerBin;
+    }
+
+    $ownBin = $packageRoot . '/vendor/bin/rector';
+    if (file_exists($ownBin)) {
+        return $ownBin;
+    }
+
+    return 'vendor/bin/rector';
+}
+
+// ---------------------------------------------------------------------------
+// Step 6: post-scan (three sections)
+// ---------------------------------------------------------------------------
+
+/**
+ * @param string[] $paths
+ * @return array{
+ *     unsupported: array<int, array{file: string, line: int, feature: string, verified: bool}>,
+ *     internalApi: array<int, array{file: string, line: int, feature: string}>,
+ *     networkException: array<int, array{file: string, line: int, feature: string}>,
+ *     residual: array<int, array{file: string, line: int, text: string}>,
+ *     deadImports: array<int, array{file: string, line: int, import: string}>
+ * }
+ */
+function postScan(string $cwd, array $paths): array
+{
+    $unsupported = [];
+    $internalApi = [];
+    $networkException = [];
+    $residual = [];
+    $deadImports = [];
+
+    $files = collectFiles($cwd, $paths, RESIDUAL_SCAN_EXTENSIONS);
+
+    foreach ($files as $file) {
+        $contents = file_get_contents($file);
+        if ($contents === false) {
+            continue;
+        }
+        $lines = explode("\n", $contents);
+        $isPhp = uvEndsWith($file, '.php');
+        $referencesUnivapay = uvContains($contents, 'Univapay\\') || uvContains($contents, 'Univapay\\\\');
+
+        foreach ($lines as $i => $line) {
+            $lineNo = $i + 1;
+            $relativeFile = relativePath($cwd, $file);
+
+            // (a) marker comments left by the flag rules.
+            if (uvContains($line, MARKER_UNSUPPORTED)) {
+                $unsupported[] = [
+                    'file' => $relativeFile,
+                    'line' => $lineNo,
+                    'feature' => extractMarkerFeature($line, MARKER_UNSUPPORTED),
+                    // "verified" tracks whether this is a CONFIRMED flag (true) or an unresolved
+                    // "(verify)" flag still needing a human to check the receiver type (false) --
+                    // same distinction as $report['unsupportedConfirmed']/['unsupportedVerify']
+                    // used to encode as two separate counts before this array replaced them.
+                    'verified' => !uvContains($line, VERIFY_SUFFIX),
+                ];
+                continue;
+            }
+            if (uvContains($line, MARKER_INTERNAL_API)) {
+                $internalApi[] = [
+                    'file' => $relativeFile,
+                    'line' => $lineNo,
+                    'feature' => extractMarkerFeature($line, MARKER_INTERNAL_API),
+                ];
+                continue;
+            }
+            if (uvContains($line, MARKER_NETWORK_EXCEPTION)) {
+                $networkException[] = [
+                    'file' => $relativeFile,
+                    'line' => $lineNo,
+                    'feature' => extractMarkerFeature($line, MARKER_NETWORK_EXCEPTION),
+                ];
+                continue;
+            }
+
+            // (b) repo-wide residual scan: any `Univapay\` not followed by `Compat\` or
+            // `Migrate\`. Only meaningful in files that reference Univapay\ at all (precision
+            // gate -- avoids false positives on unrelated words).
+            if ($referencesUnivapay) {
+                // Match both real-newline `Univapay\X` (source code) and escaped `Univapay\\X`
+                // (as it appears inside JSON/YAML/XML string literals and PHP double-quoted
+                // strings, DI configs, phpstan/psalm baselines, .phpstorm.meta.php, etc).
+                if (preg_match('/Univapay\\\\{1,2}(?!Compat\\\\|Migrate\\\\)/', $line) === 1) {
+                    $residual[] = [
+                        'file' => $relativeFile,
+                        'line' => $lineNo,
+                        'text' => trim($line),
+                    ];
+                }
+            }
+
+            // (c) known dead imports -- never map these, only report them.
+            if ($isPhp) {
+                foreach (DEAD_IMPORTS as $deadImport) {
+                    if (preg_match('/\buse\s+\\\\?' . preg_quote($deadImport, '/') . '\b/', $line) === 1) {
+                        $deadImports[] = [
+                            'file' => $relativeFile,
+                            'line' => $lineNo,
+                            'import' => $deadImport,
+                        ];
+                    }
+                }
+            }
+        }
+    }
+
+    return [
+        'unsupported' => $unsupported,
+        'internalApi' => $internalApi,
+        'networkException' => $networkException,
+        'residual' => $residual,
+        'deadImports' => $deadImports,
+    ];
+}
+
+/**
+ * Extracts the "feature" token (a class basename or `method` name, per
+ * FlagUnsupportedFeatureRector::buildComment()/FlagInternalApiUsageRector's equivalent) from a
+ * marker-comment line: the first whitespace-delimited token immediately following the marker
+ * text, e.g. `// @univapay-migrate:unsupported listLedgers — this throws ...` -> `listLedgers`,
+ * `// @univapay-migrate:internal-api Utility\HttpUtils — no compat replacement ...` ->
+ * `Utility\HttpUtils`. Never contains the literal marker text itself, so this is safe to call
+ * with any of the three MARKER_* constants.
+ */
+function extractMarkerFeature(string $line, string $marker): string
+{
+    $pos = strpos($line, $marker);
+    if ($pos === false) {
+        return '';
+    }
+    $rest = ltrim(substr($line, $pos + strlen($marker)));
+    if (preg_match('/^(\S+)/', $rest, $matches) === 1) {
+        return $matches[1];
+    }
+    return '';
+}
+
+/**
+ * @param string[] $paths
+ * @param string[] $extensions
+ * @return string[]
+ */
+function collectFiles(string $cwd, array $paths, array $extensions): array
+{
+    $files = [];
+    foreach ($paths as $path) {
+        $absolute = uvStartsWith($path, '/') ? $path : $cwd . '/' . ltrim($path, '/');
+        if (!is_dir($absolute)) {
+            continue;
+        }
+
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($absolute, FilesystemIterator::SKIP_DOTS)
+        );
+        /** @var SplFileInfo $fileInfo */
+        foreach ($iterator as $fileInfo) {
+            if (!$fileInfo->isFile()) {
+                continue;
+            }
+            $realPath = $fileInfo->getPathname();
+
+            if (isExcludedPath($realPath)) {
+                continue;
+            }
+
+            if (!hasAllowedExtension($realPath, $extensions)) {
+                continue;
+            }
+
+            $files[] = $realPath;
+        }
+    }
+
+    return array_values(array_unique($files));
+}
+
+function isExcludedPath(string $path): bool
+{
+    foreach (DEFAULT_EXCLUDED_DIRS as $dir) {
+        if (uvContains($path, '/' . $dir . '/')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * @param string[] $extensions
+ */
+function hasAllowedExtension(string $path, array $extensions): bool
+{
+    foreach ($extensions as $ext) {
+        if (uvEndsWith($path, '.' . $ext)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function relativePath(string $cwd, string $absolute): string
+{
+    if (uvStartsWith($absolute, $cwd . '/')) {
+        return substr($absolute, strlen($cwd) + 1);
+    }
+    return $absolute;
+}
+
+/**
+ * @param array{
+ *     unsupported: array<int, array{file: string, line: int, feature: string, verified: bool}>,
+ *     internalApi: array<int, array{file: string, line: int, feature: string}>,
+ *     networkException: array<int, array{file: string, line: int, feature: string}>,
+ *     residual: array<int, array{file: string, line: int, text: string}>,
+ *     deadImports: array<int, array{file: string, line: int, import: string}>
+ * } $report
+ */
+function printReport(array $report): void
+{
+    $unsupportedConfirmed = countUnsupported($report['unsupported'], true);
+    $unsupportedVerify = countUnsupported($report['unsupported'], false);
+
+    echo "\n--- (a) @univapay-migrate markers ---\n";
+    echo "unsupported (confirmed): {$unsupportedConfirmed}\n";
+    echo "unsupported (verify -- unresolved receiver, warning unless --strict): {$unsupportedVerify}\n";
+    echo "internal-api usages flagged: " . count($report['internalApi']) . "\n";
+    echo "network-exception (WpOrg\\Requests\\*) usages flagged: " . count($report['networkException']) . "\n";
+
+    echo "\n--- (b) residual Univapay\\ references (not Compat\\/Migrate\\) ---\n";
+    if ($report['residual'] === []) {
+        echo "none found\n";
+    } else {
+        foreach ($report['residual'] as $entry) {
+            echo "  {$entry['file']}:{$entry['line']}: {$entry['text']}\n";
+        }
+        echo count($report['residual']) . " residual reference(s) -- review and fix manually " .
+            "(string FQCNs, DI configs, phpstan/psalm baselines, .phpstorm.meta.php, etc. are not " .
+            "rewritten by Rector).\n";
+    }
+
+    echo "\n--- (c) known dead imports (never existed in the real SDK; safe to delete) ---\n";
+    if ($report['deadImports'] === []) {
+        echo "none found\n";
+    } else {
+        foreach ($report['deadImports'] as $entry) {
+            echo "  {$entry['file']}:{$entry['line']}: `{$entry['import']}` -- dead import, safe to delete\n";
+        }
+    }
+    echo "\n";
+}
+
+function printNextSteps(string $cwd): void
+{
+    echo "--- Next steps ---\n";
+    echo "1. Run your test suite.\n";
+    echo "2. Drain any queues / flush any caches holding serialized old-SDK objects " .
+        "(class names changed; unserializing old objects without the class_alias safety net " .
+        "will fail).\n";
+    echo "3. Regenerate PHPStan/Psalm baselines and IDE helper files.\n";
+    echo "4. Review every entry in sections (a)-(c) above; unsupported-feature flags need a " .
+        "manual call-site decision, internal-API and network-exception flags need a manual " .
+        "port, and residual references need a manual fix (Rector cannot safely touch " .
+        "strings/config it cannot prove are Univapay FQCNs in every case).\n";
+    // Univapay\Migrate\GuideUrl::MIGRATION_GUIDE is the single source of truth this bin script
+    // and every @univapay-migrate:* marker comment share (see src/GuideUrl.php). Guard with
+    // class_exists rather than a hard `use` import: this script is meant to run with nothing
+    // more than the PHP binary and a working Composer install, and must still print a sensible
+    // fallback if the class somehow isn't autoloadable in an unusual install layout.
+    $guideUrl = class_exists('Univapay\\Migrate\\GuideUrl')
+        ? constant('Univapay\\Migrate\\GuideUrl::MIGRATION_GUIDE')
+        : 'https://univapay.com/docs/guides/php-sdk-migration';
+    echo "5. See the migration guide: {$guideUrl}\n";
+    echo "\n";
+}
+
+// ---------------------------------------------------------------------------
+// Process execution (proc_open-based, no external process-management library)
+// ---------------------------------------------------------------------------
+
+/**
+ * Runs a command, streaming its stdout/stderr straight through to ours. Used for the two
+ * mutating Composer calls and for `rector process` itself, where the operator should see live
+ * output.
+ *
+ * @param string[] $command
+ */
+function runCommand(array $command, string $cwd, bool $dryRun, string $label): int
+{
+    echo "\$ " . implode(' ', array_map('escapeShellArgForDisplay', $command)) . "\n";
+
+    if ($dryRun) {
+        echo "[dry-run] skipped: {$label}\n";
+        return 0;
+    }
+
+    $descriptorSpec = [
+        0 => STDIN,
+        1 => STDOUT,
+        2 => STDERR,
+    ];
+
+    $process = @proc_open($command, $descriptorSpec, $pipes, $cwd);
+    if (!is_resource($process)) {
+        fwrite(STDERR, "Failed to start process for: {$label}\n");
+        return EXIT_USAGE_ERROR;
+    }
+
+    return proc_close($process);
+}
+
+/**
+ * Runs a command and captures its output instead of streaming it, for steps whose output this
+ * script needs to parse (`composer why`, `composer check-platform-reqs`).
+ *
+ * @param string[] $command
+ * @return array{0: int, 1: string}
+ */
+function runCommandCaptured(array $command, string $cwd): array
+{
+    $descriptorSpec = [
+        0 => ['pipe', 'r'],
+        1 => ['pipe', 'w'],
+        2 => ['pipe', 'w'],
+    ];
+
+    // Silenced: proc_open() emits an engine-level E_WARNING (not a child-process stderr byte)
+    // when the target binary does not exist at all, e.g. `composer` missing from PATH. That
+    // failure is reported cleanly via the returned non-zero exit code instead.
+    $process = @proc_open($command, $descriptorSpec, $pipes, $cwd);
+    if (!is_resource($process)) {
+        return [EXIT_USAGE_ERROR, ''];
+    }
+
+    fclose($pipes[0]);
+    $stdout = stream_get_contents($pipes[1]) ?: '';
+    $stderr = stream_get_contents($pipes[2]) ?: '';
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+
+    $exitCode = proc_close($process);
+
+    return [$exitCode, $stdout . $stderr];
+}
+
+function escapeShellArgForDisplay(string $arg): string
+{
+    return preg_match('/\s/', $arg) === 1 ? escapeshellarg($arg) : $arg;
+}
+
+function indentBlock(string $text): string
+{
+    $lines = explode("\n", trim($text));
+    return implode("\n", array_map(static fn (string $line): string => '    ' . $line, $lines));
+}
+
+// ---------------------------------------------------------------------------
+// JSON helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * @return array<string, mixed>|null
+ */
+function readJson(string $path): ?array
+{
+    if (!is_file($path)) {
+        return null;
+    }
+    $contents = file_get_contents($path);
+    if ($contents === false) {
+        return null;
+    }
+    $decoded = json_decode($contents, true);
+    return is_array($decoded) ? $decoded : null;
+}
+
+/**
+ * Writes `univapay-migrate-report.json` to the consumer's cwd (unless --no-report was passed) --
+ * a machine-readable mirror of the stdout report, built from the exact same in-memory arrays
+ * printReport() prints from (postScan()'s return value), never a second scan of the filesystem.
+ *
+ * "exitCode" is the FINAL exit code this invocation returns, i.e. it already reflects
+ * --allow-unsupported's downgrade -- a consumer reading only this file (not stdout/the process
+ * exit code) sees the same pass/fail verdict either way.
+ *
+ * @param array{
+ *     unsupported: array<int, array{file: string, line: int, feature: string, verified: bool}>,
+ *     internalApi: array<int, array{file: string, line: int, feature: string}>,
+ *     networkException: array<int, array{file: string, line: int, feature: string}>,
+ *     residual: array<int, array{file: string, line: int, text: string}>,
+ *     deadImports: array<int, array{file: string, line: int, import: string}>
+ * } $report
+ */
+function writeJsonReport(string $cwd, array $report, int $exitCode): void
+{
+    $payload = [
+        'version' => REPORT_VERSION,
+        'exitCode' => $exitCode,
+        'unsupported' => $report['unsupported'],
+        'internalApi' => $report['internalApi'],
+        'networkException' => $report['networkException'],
+        'residualReferences' => $report['residual'],
+        'deadImports' => $report['deadImports'],
+    ];
+
+    $json = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    if ($json === false) {
+        fwrite(STDERR, "Warning: could not JSON-encode the post-scan report; " . REPORT_FILENAME . " not written.\n");
+        return;
+    }
+
+    file_put_contents($cwd . '/' . REPORT_FILENAME, $json . "\n");
+}
+
+exit(main($argv));

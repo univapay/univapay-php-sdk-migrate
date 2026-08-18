@@ -1,0 +1,192 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    name: composer validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.2"
+          tools: composer:v2
+      # Deliberately not --strict: `composer validate --strict` fails on the exact-version pin
+      # for rector/rector, which is intentional (golden-test determinism — see NOTES.md), not a
+      # mistake. Plain `composer validate` still fails on real schema errors and only reports
+      # that one pin as a (expected) warning.
+      - run: composer validate
+      - run: composer install --prefer-dist --no-progress
+
+  lint:
+    name: "php -l (PHP ${{ matrix.php }})"
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        php: ["7.4", "8.2", "8.3"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+      - name: Lint every PHP file
+        run: |
+          set -e
+          find . -path ./vendor -prune -o -name "*.php" -print -exec php -l {} \;
+          php -l bin/univapay-migrate
+
+  unit-tests:
+    name: PHPUnit (smoke tests + Rector fixtures)
+    runs-on: ubuntu-latest
+    needs: [validate]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.2"
+          tools: composer:v2
+      - run: composer install --prefer-dist --no-progress
+      # tests/phpunit.xml's single "unit" testsuite already picks up every *Test.php file under
+      # tests/, including tests/Rector/PhpSdkToCompatRectorTest.php (the Rector fixture suite
+      # driving tests/Rector/Fixture/*.php.inc through the real production
+      # config/sets/php-sdk-to-compat.php set) alongside the ClassMapTest smoke tests, and
+      # tests/E2e/GoldenMigrationTest.php (the E2E golden migration corpus -- runs the
+      # real bin/univapay-migrate end to end with --skip-composer, no network required) -- no
+      # separate testsuite or job is needed. `composer:v2` is on PATH here (via setup-php's
+      # `tools:`), which GoldenMigrationTest's subprocess invocation of bin/univapay-migrate needs
+      # for its preflight `composer why`/`check-platform-reqs` calls.
+      #
+      # `--exclude-group map-integrity`: this run has neither UNIVAPAY_COMPAT_PATH nor
+      # UNIVAPAY_OLD_SDK_PATH set, so tests/MapIntegrityTest.php would just skip anyway -- but
+      # excluding it outright, rather than relying on the skip, is deliberate and load-bearing.
+      # See that test class's own doc block: its setUpBeforeClass() require_once's the compat
+      # sibling's OWN vendor/autoload.php, and that autoloader registration leaks into every OTHER
+      # test class sharing this same phpunit process, changing how Rector's PHPStan-backed
+      # docblock-type printer formats types that (only once compat is loaded) are suddenly real,
+      # reflectable classes -- confirmed to break tests/Rector/Fixture/enums.php.inc. The dedicated
+      # `map-integrity` job below runs the opposite selection (`--group map-integrity` alone, its
+      # own phpunit process, nothing else sharing it) for exactly this reason.
+      - run: vendor/bin/phpunit -c tests/phpunit.xml --exclude-group map-integrity
+
+  # e2e-execution: the actual "does migrated code run" proof. tests/E2e/GoldenMigrationTest.php
+  # only proves the STATIC rewrite + report/exit-code are correct and stable -- it never installs
+  # a real univapay/univapay-sdk-compat or executes a single line of
+  # the migrated output. This job checks out that sibling plus univapay_docs (Prism mock source +
+  # the committed generated PHP SDK tree, package name apimatic-sdks/univapaypublicapi --
+  # univapay/client-sdk is only the eventual PUBLISHED Packagist name, applied by the publishing
+  # profile, never a name the tree itself declares -- see scripts/e2e-execution.sh's own comment),
+  # then runs `--group e2e-execution`
+  # (tests/E2e/ExecutionTest.php), which shells out to scripts/e2e-execution.sh -- that script
+  # manages its OWN Prism instance via Docker (docker.io/stoplight/prism:4, started from the docs
+  # repo's own spec) and its own throwaway PHP 7.2 execution container
+  # (tests/E2e/docker/Dockerfile: the new SDK's actual floor, see that file's own comment for why
+  # this matters), so no separate `npm ci`/`npm run mock` step is needed on the runner itself
+  # (unlike the compat repo's own `integration` CI job) -- Docker, already preinstalled on every
+  # GitHub-hosted `ubuntu-latest` runner, is the only host dependency beyond PHP+Composer for the
+  # outer PHPUnit process. See ExecutionTest's own doc block for the full skip contract (this job
+  # does not skip -- both env vars below are always set here).
+  #
+  # No `--exclude-group e2e-execution` is needed on the `unit-tests` job above (unlike
+  # `map-integrity`): ExecutionTest never loads compat's autoloader in-process -- every real
+  # compat/generated-SDK call happens inside scripts/e2e-execution.sh's own Docker containers, in
+  # a completely separate PHP process/version (7.2) -- so there is no equivalent
+  # PHPStan-type-resolution pollution risk for the Rector fixture suite to guard against.
+  #
+  # `univapay/univapay-php-sdk-compat` is public on GitHub now, so no read token is needed for
+  # this checkout. `univapaycast/univapay_docs` is private (different org than this package and
+  # the compat repo), so its checkout authenticates via a read-only deploy key
+  # (`DOCS_REPO_SSH_KEY`, added to that repo specifically for this workflow) rather than a PAT.
+  # `continue-on-error: true` keeps this job's failure from blocking the rest of CI or gating
+  # branch protection until a real run against that repo has been verified green.
+  e2e-execution:
+    name: E2E execution (vs Prism, PHP 7.2)
+    runs-on: ubuntu-latest
+    needs: [validate]
+    continue-on-error: true
+    steps:
+      - name: Checkout this repo (univapay-sdk-migrate)
+        uses: actions/checkout@v5
+        with:
+          path: migrate
+      - name: Checkout univapay-sdk-compat (sibling)
+        uses: actions/checkout@v5
+        with:
+          repository: univapay/univapay-php-sdk-compat
+          path: compat
+      - name: Checkout univapay_docs (sibling)
+        uses: actions/checkout@v5
+        with:
+          repository: univapaycast/univapay_docs
+          # Private repo in a different org -- authenticate via a read-only deploy key rather
+          # than a PAT.
+          ssh-key: ${{ secrets.DOCS_REPO_SSH_KEY }}
+          path: docs
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.2"
+          tools: composer:v2
+      - name: composer install (this package)
+        run: composer install --prefer-dist --no-progress
+        working-directory: migrate
+      - name: PHPUnit e2e-execution group
+        env:
+          UNIVAPAY_COMPAT_PATH: ${{ github.workspace }}/compat
+          UNIVAPAY_DOCS_PATH: ${{ github.workspace }}/docs
+        run: vendor/bin/phpunit -c tests/phpunit.xml --group e2e-execution
+        working-directory: migrate
+
+  # map-integrity: checks out the two sibling repos this package's ClassMap rename map
+  # references (univapay/univapay-sdk-compat and univapay/php-sdk, the upstream old SDK) alongside
+  # this one, then runs tests/MapIntegrityTest.php (`@group map-integrity`) against both real
+  # checkouts -- see that test class's own doc block for exactly what it checks (every map VALUE
+  # resolves in compat, every map KEY resolves in the old SDK, and the reverse guard: every real
+  # compat class is reachable from the map or on its documented addition allowlist).
+  #
+  # Both sibling repos are public on GitHub now (`univapay/univapay-php-sdk-compat` and
+  # `univapay/univapay-php-sdk`, the real upstream repo this package migrates FROM), checked out
+  # under separate `compat`/`old-sdk` paths so their files never collide with this package's own
+  # tree, and neither checkout needs a read token.
+  map-integrity:
+    name: ClassMap <-> compat integrity
+    runs-on: ubuntu-latest
+    needs: [validate]
+    steps:
+      - name: Checkout this repo (univapay-sdk-migrate)
+        uses: actions/checkout@v5
+        with:
+          path: migrate
+      - name: Checkout univapay-sdk-compat (sibling)
+        uses: actions/checkout@v5
+        with:
+          repository: univapay/univapay-php-sdk-compat
+          path: compat
+      - name: Checkout univapay/php-sdk (old SDK, public, no token needed)
+        uses: actions/checkout@v5
+        with:
+          # This was `univapay/php-sdk` (404s -- confirmed empirically with a real `git clone`
+          # while building the cross-repo E2E suite, which also needed a real old-SDK checkout to
+          # re-verify map-integrity). The repo's actual name is `univapay-php-sdk`
+          # (matches this package's own README.md links, which were already correct); only this
+          # workflow's `repository:` value was wrong.
+          repository: univapay/univapay-php-sdk
+          path: old-sdk
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.2"
+          tools: composer:v2
+      - name: composer install (this package)
+        run: composer install --prefer-dist --no-progress
+        working-directory: migrate
+      - name: composer install (compat sibling)
+        run: composer install --prefer-dist --no-progress
+        working-directory: compat
+      - name: PHPUnit map-integrity group
+        env:
+          UNIVAPAY_COMPAT_PATH: ${{ github.workspace }}/compat
+          UNIVAPAY_OLD_SDK_PATH: ${{ github.workspace }}/old-sdk
+        run: vendor/bin/phpunit -c tests/phpunit.xml --group map-integrity
+        working-directory: migrate
