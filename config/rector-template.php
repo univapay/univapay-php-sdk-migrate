@@ -40,8 +40,8 @@ return static function (RectorConfig $rectorConfig): void {
     ]);
 
     $rectorConfig->skip([
+        __DIR__ . '/var/*',
         '*/vendor/*',
-        '*/var/*',
         '*/storage/*',
         '*/node_modules/*',
         '*.blade.php',
