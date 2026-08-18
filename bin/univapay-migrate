@@ -44,12 +44,27 @@
  * AND a `--strict`-promoted `(verify)` exit to 0. It is evaluated last, after `--strict`
  * promotion, so passing both together always nets out to exit 0 for unsupported-feature-only
  * findings -- it is never shadowed by `--strict`. It never changes what gets printed or written
- * to the JSON report (see below), only the process exit code.
+ * to the JSON report (see below), only the process exit code. Under `--phase2` (see below) it
+ * additionally downgrades a `@univapay-migrate:phase2-manual`-only exit the same way.
  *
  * `univapay-migrate-report.json`: step 7 additionally writes a machine-readable mirror of the
  * same three-section report to this file in the consumer's cwd, built from the exact same
  * in-memory arrays `printReport()` prints from (see `postScan()`) -- never a second scan.
  * `--no-report` suppresses the write entirely.
+ *
+ * ---------------------------------------------------------------------------------------------
+ * `--phase2`: a SECOND, independent migration -- `univapay/univapay-sdk-compat` onto the native,
+ * APIMatic-generated `univapay/client-sdk` (`UnivapaySetList::COMPAT_TO_NATIVE`). Review-assisted,
+ * NOT drop-in (see `src/NativeClassMap.php`'s own doc block for the full audit behind why): this
+ * mode never touches composer.json itself -- steps 2 and 6 above are ALWAYS skipped (regardless of
+ * `--skip-composer`), and the composer changes a clean report implies (`composer require
+ * univapay/client-sdk`, `composer remove univapay/univapay-sdk-compat`) are only ever printed as
+ * next steps, never run. Everything else in the fixed order still applies: preflight instead
+ * checks `Univapay\Compat\UnivapayClient` is autoloadable (compat present, not the old SDK), step 3
+ * materializes `rector-univapay-phase2.php` from `config/rector-template-phase2.php`, step 4 runs
+ * the same Rector binary against `UnivapaySetList::COMPAT_TO_NATIVE`, and step 7's report gains a
+ * fourth section for `@univapay-migrate:phase2-manual` markers (see `postScan()`) that participates
+ * in the same exit-code precedence as the unsupported-feature markers above.
  */
 
 declare(strict_types=1);
@@ -61,6 +76,7 @@ declare(strict_types=1);
 
 $packageRoot = dirname(__DIR__);
 $templatePath = $packageRoot . '/config/rector-template.php';
+$templatePathPhase2 = $packageRoot . '/config/rector-template-phase2.php';
 
 const EXIT_CLEAN = 0;
 const EXIT_USAGE_ERROR = 1;
@@ -83,6 +99,12 @@ const MARKER_INTERNAL_API = '@univapay-migrate:internal-api';
 // migration (new transport throws UnivapayNetworkError, never a WpOrg\Requests\Exception), so it
 // gets its own counted post-scan category distinct from internal-api.
 const MARKER_NETWORK_EXCEPTION = '@univapay-migrate:network-exception';
+// Phase 2 (--phase2) only -- see FlagCompatManualMigrationRector. Kept unconditionally scanned
+// (not gated behind $phase2) for the same reason every other marker constant is: a plain
+// substring match costs nothing extra to check on every line, and a phase-1 run will simply never
+// produce this marker (UnivapaySetList::PHP_SDK_TO_COMPAT never registers the rule that inserts
+// it), so its count is always 0 there.
+const MARKER_PHASE2_MANUAL = '@univapay-migrate:phase2-manual';
 const VERIFY_SUFFIX = '(verify)';
 
 const REPORT_FILENAME = 'univapay-migrate-report.json';
@@ -126,7 +148,7 @@ function uvContains(string $haystack, string $needle): bool
 
 function main(array $argv): int
 {
-    global $templatePath, $packageRoot;
+    global $templatePath, $templatePathPhase2, $packageRoot;
 
     $options = parseArgs(array_slice($argv, 1));
     if ($options === null) {
@@ -143,12 +165,18 @@ function main(array $argv): int
         return EXIT_USAGE_ERROR;
     }
 
+    $phase2 = $options['phase2'];
+
     echo "univapay-migrate\n";
     echo "consumer project: {$cwd}\n";
+    if ($phase2) {
+        echo "mode: --phase2 (univapay/univapay-sdk-compat -> native univapay/client-sdk; " .
+            "review-assisted, composer.json is never modified automatically)\n";
+    }
     if ($options['dryRun']) {
         echo "mode: --dry-run (no mutating commands will actually run)\n";
     }
-    if ($options['skipComposer']) {
+    if ($options['skipComposer'] && !$phase2) {
         echo "mode: --skip-composer (composer require/remove steps 2 and 6 are skipped)\n";
     }
     if ($options['allowUnsupported']) {
@@ -161,56 +189,68 @@ function main(array $argv): int
 
     // --- Step 1: preflight -----------------------------------------------
     echo "== Step 1/7: preflight ==\n";
-    $preflight = preflight($cwd, $options);
+    $preflight = $phase2 ? preflightPhase2($cwd, $options) : preflight($cwd, $options);
     if (!$preflight['ok']) {
         fwrite(STDERR, "\nPreflight failed: {$preflight['reason']}\n");
         return EXIT_USAGE_ERROR;
     }
     echo "preflight OK\n\n";
 
-    // --- Step 2: require compat -------------------------------------------
-    echo "== Step 2/7: require univapay/univapay-sdk-compat ==\n";
-    if ($options['skipComposer']) {
-        echo "[skip-composer] skipping composer require univapay/univapay-sdk-compat -- assumed " .
-            "already satisfied or managed externally.\n";
+    // --- Step 2: require compat / native SDK -------------------------------
+    if ($phase2) {
+        echo "== Step 2/7: require univapay/client-sdk ==\n";
+        echo "[phase2] never run automatically -- composer.json is not modified by this mode. " .
+            "Once the step 7 report is clean, run:\n";
+        echo "    composer require univapay/client-sdk\n";
     } else {
-        $exit = runCommand(
-            ['composer', 'require', 'univapay/univapay-sdk-compat:^1.0'],
-            $cwd,
-            $options['dryRun'],
-            'composer require'
-        );
-        if ($exit !== 0) {
-            fwrite(STDERR, "\ncomposer require failed (exit {$exit}). Aborting before any rewrite.\n");
-            return EXIT_USAGE_ERROR;
+        echo "== Step 2/7: require univapay/univapay-sdk-compat ==\n";
+        if ($options['skipComposer']) {
+            echo "[skip-composer] skipping composer require univapay/univapay-sdk-compat -- assumed " .
+                "already satisfied or managed externally.\n";
+        } else {
+            $exit = runCommand(
+                ['composer', 'require', 'univapay/univapay-sdk-compat:^1.0'],
+                $cwd,
+                $options['dryRun'],
+                'composer require'
+            );
+            if ($exit !== 0) {
+                fwrite(STDERR, "\ncomposer require failed (exit {$exit}). Aborting before any rewrite.\n");
+                return EXIT_USAGE_ERROR;
+            }
         }
     }
     echo "\n";
 
     // --- Step 3: materialize rector config ---------------------------------
-    echo "== Step 3/7: materialize rector-univapay.php ==\n";
+    echo "== Step 3/7: materialize " . ($phase2 ? 'rector-univapay-phase2.php' : 'rector-univapay.php') . " ==\n";
     $paths = resolvePaths($cwd, $options['paths']);
     if ($paths === []) {
         fwrite(STDERR, "Could not determine which paths to scan. Pass --paths=<dir1>,<dir2>.\n");
         return EXIT_USAGE_ERROR;
     }
     echo "paths: " . implode(', ', $paths) . "\n";
-    $configPath = $cwd . '/rector-univapay.php';
+    $configFileName = $phase2 ? 'rector-univapay-phase2.php' : 'rector-univapay.php';
+    $configPath = $cwd . '/' . $configFileName;
     // Always materialize the config, even under --dry-run: unlike the composer require/remove
     // steps, writing this local scratch file has no consequence for the consumer's dependency
     // state, and Rector needs it to exist to run `process --dry-run` at all in step 4.
-    materializeConfig($templatePath, $configPath, $paths);
+    materializeConfig($phase2 ? $templatePathPhase2 : $templatePath, $configPath, $paths);
     echo "wrote {$configPath}\n";
     echo "\n";
 
-    // --- Step 4: run rector (old SDK STILL installed) ----------------------
-    echo "== Step 4/7: run rector (old SDK still installed -- required for receiver typing) ==\n";
+    // --- Step 4: run rector --------------------------------------------------
+    if ($phase2) {
+        echo "== Step 4/7: run rector (compat-to-native flag/rewrite set) ==\n";
+    } else {
+        echo "== Step 4/7: run rector (old SDK still installed -- required for receiver typing) ==\n";
+    }
     $rectorBin = resolveRectorBin($cwd, $packageRoot);
     $rectorCommand = [
         $rectorBin,
         'process',
         '--config',
-        'rector-univapay.php',
+        $configFileName,
         '--clear-cache',
     ];
     if ($options['dryRun']) {
@@ -223,14 +263,14 @@ function main(array $argv): int
     if ($exit !== 0 && $exit !== 2) {
         // Rector itself exits 2 when it *would* change files under --dry-run; only treat other
         // non-zero codes as hard failures.
-        fwrite(STDERR, "\nrector process failed (exit {$exit}). Aborting before old SDK removal.\n");
+        fwrite(STDERR, "\nrector process failed (exit {$exit}). Aborting" . ($phase2 ? ".\n" : " before old SDK removal.\n"));
         return EXIT_USAGE_ERROR;
     }
     echo "\n";
 
     // --- Step 5: fix up any use-import Rector's own bookkeeping missed --------
     echo "== Step 5/7: fix up stale use-imports ==\n";
-    $fixedImports = fixupStaleUseImports($cwd, $paths, $options['dryRun'], $packageRoot);
+    $fixedImports = fixupStaleUseImports($cwd, $paths, $options['dryRun'], $packageRoot, $phase2);
     if ($fixedImports === []) {
         echo "none found\n";
     } else {
@@ -241,44 +281,54 @@ function main(array $argv): int
     }
     echo "\n";
 
-    // --- Step 6: remove old SDK ---------------------------------------------
-    echo "== Step 6/7: remove univapay/php-sdk ==\n";
-    if ($options['skipComposer']) {
-        echo "[skip-composer] skipping composer remove univapay/php-sdk -- managed externally.\n";
+    // --- Step 6: remove compat / old SDK ------------------------------------
+    if ($phase2) {
+        echo "== Step 6/7: remove univapay/univapay-sdk-compat ==\n";
+        echo "[phase2] never run automatically -- composer.json is not modified by this mode. " .
+            "Once the step 7 report is clean, run:\n";
+        echo "    composer remove univapay/univapay-sdk-compat\n";
     } else {
-        $exit = runCommand(
-            ['composer', 'remove', 'univapay/php-sdk'],
-            $cwd,
-            $options['dryRun'],
-            'composer remove'
-        );
-        if ($exit !== 0) {
-            fwrite(
-                STDERR,
-                "\ncomposer remove failed (exit {$exit}). Code has been rewritten but the old " .
-                "package is still required -- resolve manually and re-run `composer remove " .
-                "univapay/php-sdk`.\n"
+        echo "== Step 6/7: remove univapay/php-sdk ==\n";
+        if ($options['skipComposer']) {
+            echo "[skip-composer] skipping composer remove univapay/php-sdk -- managed externally.\n";
+        } else {
+            $exit = runCommand(
+                ['composer', 'remove', 'univapay/php-sdk'],
+                $cwd,
+                $options['dryRun'],
+                'composer remove'
             );
-            return EXIT_USAGE_ERROR;
+            if ($exit !== 0) {
+                fwrite(
+                    STDERR,
+                    "\ncomposer remove failed (exit {$exit}). Code has been rewritten but the old " .
+                    "package is still required -- resolve manually and re-run `composer remove " .
+                    "univapay/php-sdk`.\n"
+                );
+                return EXIT_USAGE_ERROR;
+            }
         }
     }
     echo "\n";
 
     // --- Step 7: post-scan ---------------------------------------------------
     echo "== Step 7/7: post-scan report ==\n";
-    $report = postScan($cwd, $paths);
+    $report = postScan($cwd, $paths, $phase2);
     printReport($report);
 
-    printNextSteps($cwd);
+    printNextSteps($cwd, $phase2);
 
     $hasConfirmedUnsupported = countUnsupported($report['unsupported'], true) > 0;
     $hasVerifyUnsupported = countUnsupported($report['unsupported'], false) > 0;
+    $hasConfirmedPhase2Manual = countUnsupported($report['phase2Manual'], true) > 0;
+    $hasVerifyPhase2Manual = countUnsupported($report['phase2Manual'], false) > 0;
 
-    // Precedence: --strict promotes a "(verify)" flag to the same failing condition a confirmed
-    // flag already is; --allow-unsupported is evaluated LAST and downgrades either failing
-    // condition back to 0. The two compose rather than fight -- passing both together always
-    // nets out to exit 0 for unsupported-feature-only findings.
-    $wouldFailOnUnsupported = $hasConfirmedUnsupported || ($hasVerifyUnsupported && $options['strict']);
+    // Precedence: --strict promotes a "(verify)" flag (unsupported-feature OR phase2-manual) to
+    // the same failing condition a confirmed flag already is; --allow-unsupported is evaluated
+    // LAST and downgrades either failing condition back to 0. The two compose rather than fight --
+    // passing both together always nets out to exit 0 for flag-only findings.
+    $wouldFailOnUnsupported = $hasConfirmedUnsupported || ($hasVerifyUnsupported && $options['strict'])
+        || $hasConfirmedPhase2Manual || ($hasVerifyPhase2Manual && $options['strict']);
 
     $exitCode = EXIT_CLEAN;
     if ($wouldFailOnUnsupported) {
@@ -286,7 +336,7 @@ function main(array $argv): int
     }
 
     if ($wouldFailOnUnsupported && $options['allowUnsupported']) {
-        echo "--allow-unsupported: downgrading unsupported-feature exit code " .
+        echo "--allow-unsupported: downgrading exit code " .
             EXIT_UNSUPPORTED_FLAGS . " -> " . EXIT_CLEAN . " (findings above are unchanged).\n\n";
     }
 
@@ -318,7 +368,7 @@ function countUnsupported(array $unsupported, bool $verified): int
 
 /**
  * @param string[] $args
- * @return array{dryRun: bool, strict: bool, skipComposer: bool, allowUnsupported: bool, noReport: bool, paths: string[], help: bool}|null
+ * @return array{dryRun: bool, strict: bool, skipComposer: bool, allowUnsupported: bool, noReport: bool, paths: string[], phase2: bool, help: bool}|null
  */
 function parseArgs(array $args): ?array
 {
@@ -329,6 +379,7 @@ function parseArgs(array $args): ?array
         'allowUnsupported' => false,
         'noReport' => false,
         'paths' => [],
+        'phase2' => false,
         'help' => false,
     ];
 
@@ -351,6 +402,10 @@ function parseArgs(array $args): ?array
         }
         if ($arg === '--no-report') {
             $options['noReport'] = true;
+            continue;
+        }
+        if ($arg === '--phase2') {
+            $options['phase2'] = true;
             continue;
         }
         if ($arg === '-h' || $arg === '--help') {
@@ -379,25 +434,40 @@ Usage: univapay-migrate [options]
 Migrates a consumer codebase from univapay/php-sdk to univapay/univapay-sdk-compat,
 via a Rector ruleset that renames namespaces and flags unsupported/internal-API usage.
 
+Pass --phase2 to instead run the SECOND, independent migration -- univapay/univapay-sdk-compat
+onto the native univapay/client-sdk. That mode is review-assisted, not drop-in: it never modifies
+composer.json itself (steps 2/6 below are always skipped and printed as next steps instead), and
+its report's fourth section (@univapay-migrate:phase2-manual markers) names, for every
+non-mechanical construct found, which category it falls into and what the native equivalent is.
+
 Options:
   --dry-run          Do not run any mutating command (composer require/remove) and pass
                       --dry-run through to `rector process`. Still writes a report.
   --strict           Promote unresolved-receiver "(verify)" flags to a hard failure
-                      (exit 2). By default only confirmed unsupported-feature flags do.
-  --allow-unsupported Downgrade an unsupported-feature exit (2) to 0. Precedence versus --strict:
-                      this downgrades BOTH a confirmed unsupported-feature exit AND a
-                      --strict-promoted "(verify)" exit -- it is evaluated last, so passing both
-                      flags together always nets out to exit 0 for unsupported-feature-only
-                      findings. Findings are still fully printed and still written to the JSON
+                      (exit 2). By default only confirmed flags do. Applies to both
+                      unsupported-feature flags and, under --phase2, phase2-manual flags.
+  --allow-unsupported Downgrade a flag-only exit (2) to 0. Precedence versus --strict:
+                      this downgrades BOTH a confirmed flag exit AND a --strict-promoted
+                      "(verify)" flag exit -- it is evaluated last, so passing both
+                      flags together always nets out to exit 0 for flag-only findings.
+                      Findings are still fully printed and still written to the JSON
                       report (see --no-report); only the process exit code changes. For CI
                       pipelines that have reviewed the findings and consciously accept them.
+                      Applies to both unsupported-feature flags and, under --phase2,
+                      phase2-manual flags.
   --skip-composer     Skip the `composer require univapay/univapay-sdk-compat` (step 2) and
                       `composer remove univapay/php-sdk` (step 6) calls entirely. Use when those
                       are managed externally (e.g. a shared monorepo lockfile) or when running
                       this tool against a fixture project with no real package registry access.
                       Rector (step 4) still requires the old SDK to be autoloadable regardless.
+                      No effect under --phase2 (which never runs those two steps anyway).
+  --phase2            Run the univapay/univapay-sdk-compat -> native univapay/client-sdk set
+                      (UnivapaySetList::COMPAT_TO_NATIVE) instead of the default
+                      univapay/php-sdk -> univapay/univapay-sdk-compat set. Never mutates
+                      composer.json (see above). Preflight instead checks
+                      Univapay\Compat\UnivapayClient is autoloadable.
   --paths=a,b,c       Comma-separated list of directories to scan. If omitted, derived from
-                      the consumer's composer.json autoload/autoload-dev PSR-4 paths.
+                      the consumer's composer.json autoload/autoload-dev PSR-4 entries.
   --no-report         Do not write univapay-migrate-report.json to the current working directory
                       after the post-scan. Written by default (see "Report file" below).
   -h, --help          Show this help text.
@@ -406,15 +476,16 @@ Exit codes:
   0   Clean run, only warnings (without --strict), or --allow-unsupported downgraded what would
       otherwise have been exit 2.
   1   Usage error or a preflight/step failure -- nothing (or only partial work) was done.
-  2   Confirmed unsupported-feature flags found (or --strict promoted "(verify)" flags), unless
-      --allow-unsupported downgraded it to 0.
+  2   Confirmed flags found (unsupported-feature, or under --phase2 phase2-manual), or --strict
+      promoted a "(verify)" flag, unless --allow-unsupported downgraded it to 0.
 
 Report file:
   Unless --no-report is passed, step 7 also writes univapay-migrate-report.json to the current
   working directory: {"version": 1, "exitCode": N, "unsupported": [...], "internalApi": [...],
-  "networkException": [...], "residualReferences": [...], "deadImports": [...]}, mirroring the
-  same stdout report -- "exitCode" is the FINAL exit code this invocation returns (i.e. already
-  reflecting any --allow-unsupported downgrade).
+  "networkException": [...], "residualReferences": [...], "deadImports": [...],
+  "phase2Manual": [...]}, mirroring the same stdout report -- "exitCode" is the FINAL exit code
+  this invocation returns (i.e. already reflecting any --allow-unsupported downgrade).
+  "phase2Manual" is only ever populated under --phase2.
 
 USAGE;
 }
@@ -529,6 +600,78 @@ function preflight(string $cwd, array $options): array
     return ['ok' => true, 'reason' => ''];
 }
 
+/**
+ * Phase-2 preflight (--phase2): sibling of preflight() above, adjusted for the
+ * compat -> native migration. Two deliberate differences from phase 1:
+ *
+ * - The autoloadability assertion checks `Univapay\Compat\UnivapayClient` (compat must be
+ *   installed -- there is nothing to migrate FROM otherwise), not the old SDK's client.
+ * - The transitive-dependency check is advisory only, never fatal: `--phase2` never runs
+ *   `composer remove` itself (see this script's own top-of-file doc comment), so there is no
+ *   automatic mutation to guard against the way phase 1's guard protects `composer remove
+ *   univapay/php-sdk` in step 6. It still surfaces `composer why univapay/univapay-sdk-compat`
+ *   output as a heads-up for the manual `composer remove` this tool prints as a next step.
+ *
+ * @return array{ok: bool, reason: string}
+ */
+function preflightPhase2(string $cwd, array $options): array
+{
+    $composerJsonPath = $cwd . '/composer.json';
+    if (!is_file($composerJsonPath)) {
+        return ['ok' => false, 'reason' => "no composer.json found in {$cwd}"];
+    }
+    echo "- composer.json found\n";
+
+    [$composerVersionExit] = runCommandCaptured(['composer', '--version'], $cwd);
+    if ($composerVersionExit !== 0) {
+        return [
+            'ok' => false,
+            'reason' => "the `composer` executable could not be run (is it installed and on PATH?)",
+        ];
+    }
+    echo "- composer executable found\n";
+
+    [$whyExit, $whyStdout] = runCommandCaptured(['composer', 'why', 'univapay/univapay-sdk-compat'], $cwd);
+    if ($whyExit === 0 && trim($whyStdout) !== '') {
+        echo "- NOTE: composer why univapay/univapay-sdk-compat reports requirer(s) -- review " .
+            "before running `composer remove univapay/univapay-sdk-compat` later:\n";
+        echo indentBlock($whyStdout) . "\n";
+    } else {
+        echo "- composer why univapay/univapay-sdk-compat: no requirers found (or command unavailable)\n";
+    }
+
+    $autoloadPath = $cwd . '/vendor/autoload.php';
+    if (!is_file($autoloadPath)) {
+        return ['ok' => false, 'reason' => "vendor/autoload.php not found -- run `composer install` first"];
+    }
+    require $autoloadPath;
+    if (!class_exists('Univapay\\Compat\\UnivapayClient')) {
+        return [
+            'ok' => false,
+            'reason' =>
+                "Univapay\\Compat\\UnivapayClient is not autoloadable -- univapay/univapay-sdk-compat " .
+                "does not appear to be installed in this project. Nothing to migrate.",
+        ];
+    }
+    echo "- Univapay\\Compat\\UnivapayClient is autoloadable (compat layer present)\n";
+
+    [$platformExit, $platformStdout, $platformStderr] = runCommandCaptured(
+        ['composer', 'check-platform-reqs'],
+        $cwd
+    );
+    $platformOut = $platformStdout . $platformStderr;
+    if ($platformExit !== 0 && stripos($platformOut, 'curl') !== false) {
+        echo "- WARNING: composer check-platform-reqs reports a curl-related platform " .
+            "requirement problem. The native SDK's transport (apimatic/unirest-php) requires " .
+            "ext-curl. Continuing, but this should be fixed before running migrated code:\n";
+        echo indentBlock($platformOut) . "\n";
+    } else {
+        echo "- composer check-platform-reqs: ok (or no curl-related issue)\n";
+    }
+
+    return ['ok' => true, 'reason' => ''];
+}
+
 // ---------------------------------------------------------------------------
 // Step 3: path resolution + config materialization
 // ---------------------------------------------------------------------------
@@ -585,7 +728,7 @@ function resolvePaths(string $cwd, array $explicitPaths): array
  * Last-resort path discovery (see resolvePaths()): scans the whole project tree (excluding
  * vendor/var/storage/node_modules/.git, same as everywhere else in this script) for any .php
  * file referencing `Univapay\` at all, and derives scan paths directly from where those
- * references live -- a file sitting at the project root is returned as a standalone file path
+ * references really are -- a file sitting at the project root is returned as a standalone file path
  * (Rector's `paths()` accepts files as well as directories -- see config/rector-template.php),
  * and a file under a subdirectory contributes that subdirectory's top-level path component.
  *
@@ -683,8 +826,8 @@ function resolveRectorBin(string $cwd, string $packageRoot): string
 // ---------------------------------------------------------------------------
 
 /**
- * Text-level safety net for `use Univapay\X;` imports that RenameClassRector's own
- * `importNames(true)` bookkeeping leaves unrenamed.
+ * Text-level safety net for `use Univapay\X;` (or, under --phase2, `use Univapay\Compat\X;`)
+ * imports that RenameClassRector's own `importNames(true)` bookkeeping leaves unrenamed.
  *
  * Verified empirically against real consumer code (a WordPress plugin, not a synthetic fixture):
  * when every usage of an imported class in a file lives inside a function declared NESTED inside
@@ -705,29 +848,40 @@ function resolveRectorBin(string $cwd, string $packageRoot): string
  * finished writing its own output, has no such interaction: it only ever touches a `use` line
  * whose FQCN Rector's own rewrite left completely alone.
  *
- * `ClassMap` is this package's OWN class, not the consumer's -- in the normal case (this package
- * installed via `composer require --dev`), the consumer's `vendor/autoload.php` (already
- * required by preflight) covers it like any other installed dependency. But an unusual install
- * layout (or a harness invoking this script directly against this package's own checkout, e.g.
- * `--skip-composer` against a fixture with no real `composer require` of this package at all --
- * see tests/E2e/GoldenMigrationTest.php's own doc block) might not have it loaded. Falls back to
- * this package's own `vendor/autoload.php`, same tier-2 fallback `resolveRectorBin()` uses for
- * the same reason; skips the whole step (rather than a fatal error) if that still doesn't work.
+ * `$phase2` switches which rename map (and therefore which "old" namespace pattern) this checks
+ * against -- `Univapay\Migrate\ClassMap::SUPPORTED` (old SDK -> compat) normally, or
+ * `Univapay\Migrate\NativeClassMap::SUPPORTED` (compat -> native) under `--phase2`. The latter is
+ * currently empty (see NativeClassMap's own doc block), so this is a guaranteed no-op under
+ * `--phase2` today -- kept parametrized rather than special-cased away so a future non-empty
+ * `NativeClassMap::SUPPORTED` entry is covered by this safety net for free.
  *
  * @param string[] $paths
  * @return array<int, array{file: string, line: int, old: string, new: string}>
  */
-function fixupStaleUseImports(string $cwd, array $paths, bool $dryRun, string $packageRoot): array
+function fixupStaleUseImports(string $cwd, array $paths, bool $dryRun, string $packageRoot, bool $phase2): array
 {
-    if (!class_exists('Univapay\\Migrate\\ClassMap')) {
+    $mapClassName = $phase2 ? 'Univapay\\Migrate\\NativeClassMap' : 'Univapay\\Migrate\\ClassMap';
+
+    if (!class_exists($mapClassName)) {
         $ownAutoload = $packageRoot . '/vendor/autoload.php';
         if (is_file($ownAutoload)) {
             require $ownAutoload;
         }
     }
-    if (!class_exists('Univapay\\Migrate\\ClassMap')) {
+    if (!class_exists($mapClassName)) {
         return [];
     }
+
+    $classMap = $phase2
+        ? \Univapay\Migrate\NativeClassMap::SUPPORTED
+        : \Univapay\Migrate\ClassMap::SUPPORTED;
+
+    $useLinePattern = $phase2
+        // `use Univapay\Compat\Foo;` not already renamed to `UnivaPay\...` (and not this
+        // package's own `Univapay\Migrate\` namespace, unreachable here in practice but kept for
+        // symmetry with the phase-1 pattern below).
+        ? '/^(\s*use\s+)\\\\?(Univapay\\\\Compat\\\\(?!Migrate\\\\)[A-Za-z0-9_\\\\]+)(.*)$/'
+        : '/^(\s*use\s+)\\\\?(Univapay\\\\(?!Compat\\\\|Migrate\\\\)[A-Za-z0-9_\\\\]+)(.*)$/';
 
     $fixed = [];
     $files = collectFiles($cwd, $paths, ['php']);
@@ -742,16 +896,12 @@ function fixupStaleUseImports(string $cwd, array $paths, bool $dryRun, string $p
         $changedFile = false;
 
         foreach ($lines as $i => $line) {
-            if (preg_match(
-                '/^(\s*use\s+)\\\\?(Univapay\\\\(?!Compat\\\\|Migrate\\\\)[A-Za-z0-9_\\\\]+)(.*)$/',
-                $line,
-                $matches
-            ) !== 1) {
+            if (preg_match($useLinePattern, $line, $matches) !== 1) {
                 continue;
             }
 
             $oldFqcn = $matches[2];
-            $newFqcn = \Univapay\Migrate\ClassMap::SUPPORTED[$oldFqcn] ?? null;
+            $newFqcn = $classMap[$oldFqcn] ?? null;
             if ($newFqcn === null) {
                 continue;
             }
@@ -776,7 +926,7 @@ function fixupStaleUseImports(string $cwd, array $paths, bool $dryRun, string $p
 }
 
 // ---------------------------------------------------------------------------
-// Step 7: post-scan (three sections)
+// Step 7: post-scan (four sections; the fourth is --phase2 only)
 // ---------------------------------------------------------------------------
 
 /**
@@ -786,16 +936,18 @@ function fixupStaleUseImports(string $cwd, array $paths, bool $dryRun, string $p
  *     internalApi: array<int, array{file: string, line: int, feature: string}>,
  *     networkException: array<int, array{file: string, line: int, feature: string}>,
  *     residual: array<int, array{file: string, line: int, text: string}>,
- *     deadImports: array<int, array{file: string, line: int, import: string}>
+ *     deadImports: array<int, array{file: string, line: int, import: string}>,
+ *     phase2Manual: array<int, array{file: string, line: int, feature: string, verified: bool}>
  * }
  */
-function postScan(string $cwd, array $paths): array
+function postScan(string $cwd, array $paths, bool $phase2 = false): array
 {
     $unsupported = [];
     $internalApi = [];
     $networkException = [];
     $residual = [];
     $deadImports = [];
+    $phase2Manual = [];
 
     $files = collectFiles($cwd, $paths, RESIDUAL_SCAN_EXTENSIONS);
 
@@ -813,6 +965,15 @@ function postScan(string $cwd, array $paths): array
             $relativeFile = relativePath($cwd, $file);
 
             // (a) marker comments left by the flag rules.
+            if (uvContains($line, MARKER_PHASE2_MANUAL)) {
+                $phase2Manual[] = [
+                    'file' => $relativeFile,
+                    'line' => $lineNo,
+                    'feature' => extractMarkerFeature($line, MARKER_PHASE2_MANUAL),
+                    'verified' => !uvContains($line, VERIFY_SUFFIX),
+                ];
+                continue;
+            }
             if (uvContains($line, MARKER_UNSUPPORTED)) {
                 $unsupported[] = [
                     'file' => $relativeFile,
@@ -843,31 +1004,50 @@ function postScan(string $cwd, array $paths): array
                 continue;
             }
 
-            // (b) repo-wide residual scan: any `Univapay\` not followed by `Compat\` or
-            // `Migrate\`. Only meaningful in files that reference Univapay\ at all (precision
-            // gate -- avoids false positives on unrelated words).
+            // (b) repo-wide residual scan.
             //
             // Excludes the file's own `namespace Univapay\...;`/`namespace Univapay\... {`
             // declaration: a consumer whose OWN root namespace happens to start with `Univapay\`
             // (verified empirically -- a real consumer project's test suite used
             // `namespace Univapay\WooCommerce\Tests;`) would otherwise show up as a false-positive
             // "residual SDK reference" on every single file, forever, since that line is declaring
-            // the consumer's own namespace, not referencing the old SDK's.
+            // the consumer's own namespace, not referencing the old SDK's/compat's.
             $isNamespaceDeclaration = preg_match('/^\s*namespace\s+[A-Za-z0-9_\\\\]+\s*[;{]/', $line) === 1;
             if ($referencesUnivapay && !$isNamespaceDeclaration) {
-                // Match both real-newline `Univapay\X` (source code) and escaped `Univapay\\X`
-                // (as it appears inside JSON/YAML/XML string literals and PHP double-quoted
-                // strings, DI configs, phpstan/psalm baselines, .phpstorm.meta.php, etc).
-                if (preg_match('/Univapay\\\\{1,2}(?!Compat\\\\|Migrate\\\\)/', $line) === 1) {
-                    $residual[] = [
-                        'file' => $relativeFile,
-                        'line' => $lineNo,
-                        'text' => trim($line),
-                    ];
+                if ($phase2) {
+                    // Under --phase2, NativeClassMap::SUPPORTED is empty (see its own doc block),
+                    // so literally every Univapay\Compat\ reference in every .php file survives
+                    // the run untouched -- a residual scan with the phase-1 shape would just
+                    // reprint the entire codebase's compat usage as "residual", duplicating what
+                    // the @univapay-migrate:phase2-manual markers (and the flag rule's Name-node
+                    // coverage) already report per-category. Restricting this section to NON-PHP
+                    // files keeps its original phase-1 purpose intact -- catching a string FQCN in
+                    // a DI config/serializer mapping/static-analysis baseline that Rector's AST-only
+                    // rules can never see -- without the noise.
+                    if (!$isPhp && preg_match('/Univapay\\\\{1,2}Compat\\\\{1,2}/', $line) === 1) {
+                        $residual[] = [
+                            'file' => $relativeFile,
+                            'line' => $lineNo,
+                            'text' => trim($line),
+                        ];
+                    }
+                } else {
+                    // Match both real-newline `Univapay\X` (source code) and escaped `Univapay\\X`
+                    // (as it appears inside JSON/YAML/XML string literals and PHP double-quoted
+                    // strings, DI configs, phpstan/psalm baselines, .phpstorm.meta.php, etc).
+                    if (preg_match('/Univapay\\\\{1,2}(?!Compat\\\\|Migrate\\\\)/', $line) === 1) {
+                        $residual[] = [
+                            'file' => $relativeFile,
+                            'line' => $lineNo,
+                            'text' => trim($line),
+                        ];
+                    }
                 }
             }
 
-            // (c) known dead imports -- never map these, only report them.
+            // (c) known dead imports -- never map these, only report them. Phase-1-only in
+            // practice (every DEAD_IMPORTS entry is a bare old-SDK-style FQCN with no `Compat\`
+            // segment), left unconditional since it is a harmless no-op under --phase2.
             if ($isPhp) {
                 foreach (DEAD_IMPORTS as $deadImport) {
                     if (preg_match('/\buse\s+\\\\?' . preg_quote($deadImport, '/') . '\b/', $line) === 1) {
@@ -888,17 +1068,17 @@ function postScan(string $cwd, array $paths): array
         'networkException' => $networkException,
         'residual' => $residual,
         'deadImports' => $deadImports,
+        'phase2Manual' => $phase2Manual,
     ];
 }
 
 /**
- * Extracts the "feature" token (a class basename or `method` name, per
- * FlagUnsupportedFeatureRector::buildComment()/FlagInternalApiUsageRector's equivalent) from a
- * marker-comment line: the first whitespace-delimited token immediately following the marker
- * text, e.g. `// @univapay-migrate:unsupported listLedgers — this throws ...` -> `listLedgers`,
- * `// @univapay-migrate:internal-api Utility\HttpUtils — no compat replacement ...` ->
- * `Utility\HttpUtils`. Never contains the literal marker text itself, so this is safe to call
- * with any of the three MARKER_* constants.
+ * Extracts the "feature" token (a class basename, `method` name, or property name, per
+ * FlagUnsupportedFeatureRector::buildComment()/FlagInternalApiUsageRector's/
+ * FlagCompatManualMigrationRector's equivalents) from a marker-comment line, e.g.
+ * `// @univapay-migrate:unsupported listLedgers — this throws ...` -> `listLedgers`,
+ * `// @univapay-migrate:phase2-manual ChargeStatus [typed-enum] — ...` -> `ChargeStatus`. Never
+ * contains the literal marker text itself, so this is safe to call with any MARKER_* constant.
  */
 function extractMarkerFeature(string $line, string $marker): string
 {
@@ -1004,7 +1184,8 @@ function relativePath(string $cwd, string $absolute): string
  *     internalApi: array<int, array{file: string, line: int, feature: string}>,
  *     networkException: array<int, array{file: string, line: int, feature: string}>,
  *     residual: array<int, array{file: string, line: int, text: string}>,
- *     deadImports: array<int, array{file: string, line: int, import: string}>
+ *     deadImports: array<int, array{file: string, line: int, import: string}>,
+ *     phase2Manual: array<int, array{file: string, line: int, feature: string, verified: bool}>
  * } $report
  */
 function printReport(array $report): void
@@ -1038,12 +1219,50 @@ function printReport(array $report): void
             echo "  {$entry['file']}:{$entry['line']}: `{$entry['import']}` -- dead import, safe to delete\n";
         }
     }
+
+    // Always printed (not gated on --phase2): a phase-1 run will always show 0/0 here, since
+    // UnivapaySetList::PHP_SDK_TO_COMPAT never registers FlagCompatManualMigrationRector.
+    $phase2ManualConfirmed = countUnsupported($report['phase2Manual'], true);
+    $phase2ManualVerify = countUnsupported($report['phase2Manual'], false);
+    echo "\n--- (d) @univapay-migrate:phase2-manual markers (--phase2 only) ---\n";
+    echo "phase2 manual-review items (confirmed): {$phase2ManualConfirmed}\n";
+    echo "phase2 manual-review items (verify -- unresolved receiver, warning unless --strict): {$phase2ManualVerify}\n";
+    if ($report['phase2Manual'] !== []) {
+        foreach ($report['phase2Manual'] as $entry) {
+            echo "  {$entry['file']}:{$entry['line']}: {$entry['feature']}\n";
+        }
+    }
     echo "\n";
 }
 
-function printNextSteps(string $cwd): void
+function printNextSteps(string $cwd, bool $phase2 = false): void
 {
+    // Univapay\Migrate\GuideUrl::MIGRATION_GUIDE is the single source of truth this bin script
+    // and every @univapay-migrate:* marker comment share (see src/GuideUrl.php). Guard with
+    // class_exists rather than a hard `use` import: this script is meant to run with nothing
+    // more than the PHP binary and a working Composer install, and must still print a sensible
+    // fallback if the class somehow isn't autoloadable in an unusual install layout.
+    $guideUrl = class_exists('Univapay\\Migrate\\GuideUrl')
+        ? constant('Univapay\\Migrate\\GuideUrl::MIGRATION_GUIDE')
+        : 'https://univapay.com/docs/guides/php-sdk-migration';
+
     echo "--- Next steps ---\n";
+
+    if ($phase2) {
+        echo "1. Review every @univapay-migrate:phase2-manual marker above (and the " .
+            "\"phase2Manual\" section of " . REPORT_FILENAME . ") -- each names a category and " .
+            "the native equivalent construct to migrate to by hand. This set never rewrites these " .
+            "constructs for you.\n";
+        echo "2. Once every marker has been addressed (or consciously accepted), run:\n";
+        echo "     composer require univapay/client-sdk\n";
+        echo "     composer remove univapay/univapay-sdk-compat\n";
+        echo "3. Run your test suite.\n";
+        echo "4. Drain any queues / flush any caches holding serialized compat objects.\n";
+        echo "5. See the migration guide: {$guideUrl}\n";
+        echo "\n";
+        return;
+    }
+
     echo "1. Run your test suite.\n";
     echo "2. Drain any queues / flush any caches holding serialized old-SDK objects " .
         "(class names changed; unserializing old objects without the class_alias safety net " .
@@ -1053,15 +1272,9 @@ function printNextSteps(string $cwd): void
         "manual call-site decision, internal-API and network-exception flags need a manual " .
         "port, and residual references need a manual fix (Rector cannot safely touch " .
         "strings/config it cannot prove are Univapay FQCNs in every case).\n";
-    // Univapay\Migrate\GuideUrl::MIGRATION_GUIDE is the single source of truth this bin script
-    // and every @univapay-migrate:* marker comment share (see src/GuideUrl.php). Guard with
-    // class_exists rather than a hard `use` import: this script is meant to run with nothing
-    // more than the PHP binary and a working Composer install, and must still print a sensible
-    // fallback if the class somehow isn't autoloadable in an unusual install layout.
-    $guideUrl = class_exists('Univapay\\Migrate\\GuideUrl')
-        ? constant('Univapay\\Migrate\\GuideUrl::MIGRATION_GUIDE')
-        : 'https://univapay.com/docs/guides/php-sdk-migration';
     echo "5. See the migration guide: {$guideUrl}\n";
+    echo "6. Once you're ready to go further: `vendor/bin/univapay-migrate --phase2` starts the " .
+        "SECOND, review-assisted migration onto the native univapay/client-sdk.\n";
     echo "\n";
 }
 
@@ -1188,7 +1401,8 @@ function readJson(string $path): ?array
  *     internalApi: array<int, array{file: string, line: int, feature: string}>,
  *     networkException: array<int, array{file: string, line: int, feature: string}>,
  *     residual: array<int, array{file: string, line: int, text: string}>,
- *     deadImports: array<int, array{file: string, line: int, import: string}>
+ *     deadImports: array<int, array{file: string, line: int, import: string}>,
+ *     phase2Manual: array<int, array{file: string, line: int, feature: string, verified: bool}>
  * } $report
  */
 function writeJsonReport(string $cwd, array $report, int $exitCode): void
@@ -1201,6 +1415,7 @@ function writeJsonReport(string $cwd, array $report, int $exitCode): void
         'networkException' => $report['networkException'],
         'residualReferences' => $report['residual'],
         'deadImports' => $report['deadImports'],
+        'phase2Manual' => $report['phase2Manual'],
     ];
 
     $json = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
