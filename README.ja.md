@@ -66,6 +66,7 @@ univapay/php-sdk` → 3 セクション構成のレポート出力。この順�
 | `--skip-composer` | `composer require univapay/univapay-sdk-compat` と `composer remove univapay/php-sdk` の両方の手順を完全にスキップします。モノレポや、依存関係の変更を自前で管理している CI パイプライン向けです。この場合でも、Rector の実行時には旧 SDK が autoload 可能である必要があります。 |
 | `--paths=a,b,c` | スキャン対象ディレクトリをカンマ区切りで指定します。省略した場合は、`composer.json` の `autoload`/`autoload-dev` に定義された PSR-4（および classmap）のパスから自動的に導出され、それも無ければ `src/` にフォールバックします。 |
 | `--no-report` | カレントディレクトリへの `univapay-migrate-report.json` の書き出しをスキップします。既定では書き出されます —— 詳細は後述の「終了コードとレポート」を参照してください。 |
+| `--phase2` | 既定のセットの代わりに、2 つ目の独立した移行 —— `univapay/univapay-sdk-compat` からネイティブな `univapay/client-sdk` への移行 —— を実行します。`composer.json` には一切触れません。詳しくは後述の「ネイティブ SDK へのさらなる移行」を参照してください。 |
 | `-h`, `--help` | 使い方を表示して終了します。 |
 
 ### 書き換え前後の実例
@@ -296,11 +297,58 @@ API を呼び出す、という進め方です。両方の経路は同じエン�
 [`univapay-sdk-compat` の README](https://github.com/univapay/univapay-php-sdk-compat#migrating-off-the-compat-layer)
 を参照してください。
 
-本パッケージには将来、この 2 段階目の移行のうち機械的に処理できる部分（1:1 で対応するデータ形状に
-関する名前空間のみのリネームや、例外クラスのリネームなど）をカバーする
-`UnivapaySetList::COMPAT_TO_NATIVE` という Rector セットを追加する予定です。ただし enum の同一性比較や
-public プロパティへの直接アクセスなど、compat の API 形状から完全に離れる際には依然として人間の判断が
-必要になるため、これは「レビュー不要」なリネームではなく「レビュー支援」を目的としたものになります。
+### フェーズ2: `--phase2`
+
+```bash
+vendor/bin/univapay-migrate --phase2
+```
+
+既定のセットの代わりに `UnivapaySetList::COMPAT_TO_NATIVE` を実行します。**レビュー支援であり、
+無修正で使えるものではありません。** 両方のツリー（`univapay/univapay-sdk-compat` の `src/` と、
+ネイティブな `univapay/client-sdk` の `src/Models`）を監査した結果、機械的にリネームしても安全な
+データクラス・例外クラスは 1 つも見つかりませんでした —— compat のリソースはすべて public
+プロパティを使うのに対し、ネイティブのモデルはすべて getter の背後にある private プロパティを使います。
+compat の enum はすべて `TypedEnum` シングルトンであるのに対し、ネイティブの enum は単なる文字列の
+`const` です。そして compat の例外サブクラスはどれも多対一で
+`UnivaPay\Exceptions\ApiException`/`ApiErrorException` に collapse してしまいます。そのため、この
+セットにはリネームマップの代わりに 1 つのルール（`FlagCompatManualMigrationRector`）があり、人間の
+判断が必要な各構文の直前に、カテゴリ名とネイティブ側の対応先を示す冪等な `//
+@univapay-migrate:phase2-manual` マーカーコメントを挿入します。
+
+| カテゴリ | compat 側の構文 | ネイティブ側の対応 |
+|---|---|---|
+| `typed-enum` | `ChargeStatus::SUCCESSFUL()`、`->getValue()`、`===`、`switch` | `UnivaPay\Models\ChargeStatus::SUCCESSFUL`（単なる文字列 `const`） |
+| `money` | `Money\Money`/`Money\Currency`（moneyphp） | `int $amount` + `string $currency` のフラットな組 |
+| `public-property` | `$charge->status` | `$charge->getStatus()` / `ApiResponse` 上の `->getResult()->getStatus()` |
+| `poll` | `->awaitResult()` | `pollCharge()`/`pollRefund()`/`pollCancel()`/`pollSubscription()` |
+| `pagination` | `Paginated`、`->getNext()`/`->getPrevious()`、`Mixins\Get*` トレイト群 | ネイティブの一覧エンドポイントに対するカーソルパラメータのループ |
+| `webhook` | `->parseWebhookData()` | `UnivaPay\Events\Webhooks\*Handler` |
+| `client-construction` | `UnivapayClient`/`UnivapayClientOptions`、`AppJWT`/`StoreAppJWT`/`MerchantAppJWT`、`Requests\Handlers\*` のリトライ/レート制限ハンドラ | `UnivapayClientSdkClientBuilder` + `BearerAuthCredentialsBuilder`、`enableRetries()`/`numberOfRetries()` |
+| `exception-handling` | `Univapay\Compat\Errors\*` の catch/throw/`instanceof` | `ApiException`/`ApiErrorException`。`getHttpResponse()->getStatusCode()`/`getCodeProperty()` で区別 |
+| `internal-utility` | `Univapay\Compat\Utility\*` | 対応なし —— 自前でロジックを移植してください |
+
+前述の混在モード用エスケープハッチである `->native()` は、決してフラグ対象になりません。
+
+**入力:** 既定のセットと同じ `--paths`/`--dry-run`/`--strict`/`--allow-unsupported`/`--no-report`
+フラグが使えます。対象が `@univapay-migrate:unsupported` マーカーではなく
+`@univapay-migrate:phase2-manual` マーカーになる点だけが異なります。`--skip-composer` はここでは
+効果を持ちません —— 理由は「出力」を参照してください。
+
+**出力:** `--phase2` は **`composer.json` 自体を一切変更しません。** 手順 2 と 6（`composer
+require`/`composer remove`）は常にスキップされ、代わりに次のステップとして表示されます。
+
+```bash
+composer require univapay/client-sdk
+composer remove univapay/univapay-sdk-compat
+```
+
+プリフライトチェックは、旧 SDK のクライアントではなく `Univapay\Compat\UnivapayClient` が
+autoload 可能かどうかを確認します（compat がインストールされていなければ、そもそも移行元が
+存在しません）。レポートの 4 番目のセクションと `univapay-migrate-report.json` の
+`"phase2Manual"` 配列は、未サポート機能セクションとまったく同じ形式です —— 確定したフラグは
+`"verified": true`、受け側の型を解決できなかった `(verify)` フラグは `false` となり、終了コードの
+優先順位も同じです（`--strict` は `(verify)` を失敗へ昇格させ、`--allow-unsupported` は
+いずれの場合も終了コードを `0` に格下げします）。
 
 ## 移行完了後にこのパッケージを削除する
 
